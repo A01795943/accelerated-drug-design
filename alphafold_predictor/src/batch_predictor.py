@@ -50,6 +50,10 @@ class BatchPredictor:
             logger.error(f"Error en predicción: {str(e)}")
             logger.error(f"Detalles: {embedding}")
             logger.error(f"Detalles: {prediction}")
+            logger.error(f"Detalles: {embedding_iptm1}")
+            logger.error(f"Detalles: {embedding_iptm2}")
+
+
 
             return {
                 'sequence': sequence,

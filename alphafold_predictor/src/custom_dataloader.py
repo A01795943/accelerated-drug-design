@@ -1,10 +1,17 @@
 import torch
 import pandas as pd
+import logging
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
+
 
 class CustomProteinDataset(Dataset):
     def __init__(self, path):
-        df = pd.read_csv(path)
+        try:
+            df = pd.read_csv(path)
+        except:
+            logging.error("Ruta no valida, verifica que esté al mismo nivel del run_prediction.py")
         #Se concatena primero para el plddt
         self.sequences = [row.replace("/","") for row in df['seq'].tolist()]
         #Se separa para el iptm
