@@ -71,7 +71,7 @@ RUN aria2c -q -x 16 -d RFdiffusion/models http://files.ipd.uw.edu/pub/RFdiffusio
 # DESCARGAR PARÁMETROS ALPHAFOLD
 RUN mkdir -p params && \
     aria2c -q -x 16 https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar && \
-    tar -xf alphafold_params_2022-12-06.tar -C params && \
+    tar --no-same-owner --no-same-permissions -xf alphafold_params_2022-12-06.tar -C params && \
     rm alphafold_params_2022-12-06.tar && \
     touch params/done.txt
 
