@@ -41,7 +41,7 @@ def download_pdb(pdb_id, remove_chain=None):
     if not pdb_id or len(pdb_id) != 4:
         return pdb_id
     
-    pdb_file = f"/workspace/RFdiffusion/{pdb_id}.pdb"
+    pdb_file = f"/workspace/outputs/{pdb_id}.pdb"
     
     if os.path.exists(pdb_file):
         print(f"- PDB encontrado: {pdb_file}")
@@ -59,7 +59,7 @@ def download_pdb(pdb_id, remove_chain=None):
             
             # Remover cadena SOLO si se especifica
             if remove_chain is not None:
-                original_file = f"/workspace/RFdiffusion/{pdb_id}_ORIGINAL.pdb"
+                original_file = f"/workspace/outputs/{pdb_id}_ORIGINAL.pdb"
                 shutil.copy2(pdb_file, original_file)
                 print(f"- Copia original guardada: {original_file}")
                 
