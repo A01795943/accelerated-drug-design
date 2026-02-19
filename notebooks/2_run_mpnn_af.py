@@ -18,6 +18,7 @@ OUTPUTS_DIR = "/workspace/outputs"
 def run_proteinmpnn_alphafold(
     run_name: str,
     contigs: str,
+    pdb_file: str | None = None,
     copies: int = 1,
     num_seqs: int = 8,
     initial_guess: bool = False,
@@ -29,7 +30,10 @@ def run_proteinmpnn_alphafold(
     design_num: int = 0,
 ) -> bool:
     """Run ProteinMPNN + AlphaFold validation. Output to /workspace/outputs/{run_name}/."""
-    pdb_file = f"{OUTPUTS_DIR}/{run_name}_{design_num}.pdb"
+    if pdb_file is None:
+        pdb_file = f"{OUTPUTS_DIR}/{run_name}_{design_num}.pdb"
+    else:
+        pdb_file = os.path.abspath(pdb_file)
     if not os.path.exists(pdb_file):
         print(f"❌ No se encuentra el archivo PDB: {pdb_file}")
         return False
@@ -75,6 +79,7 @@ def run_proteinmpnn_alphafold(
 def run_proteinmpnn_only(
     run_name: str,
     contigs: str,
+    pdb_file: str | None = None,
     copies: int = 1,
     num_seqs: int = 8,
     initial_guess: bool = False,
@@ -86,7 +91,10 @@ def run_proteinmpnn_only(
     design_num: int = 0,
 ) -> bool:
     """Run ProteinMPNN only (no AlphaFold). Output to /workspace/outputs/{run_name}/."""
-    pdb_file = f"{OUTPUTS_DIR}/{run_name}_{design_num}.pdb"
+    if pdb_file is None:
+        pdb_file = f"{OUTPUTS_DIR}/{run_name}_{design_num}.pdb"
+    else:
+        pdb_file = os.path.abspath(pdb_file)
     if not os.path.exists(pdb_file):
         print(f"❌ No se encuentra el archivo PDB: {pdb_file}")
         return False
@@ -266,7 +274,8 @@ print(f"MPNN only completed. Results saved to {output_dir}")
 
 def main():
     parser = argparse.ArgumentParser(description="Step 2: ProteinMPNN sequence design")
-    parser.add_argument("--run_name", type=str, default="pipeline_run", help="Must match step 1 run_name")
+    parser.add_argument("--run_name", type=str, default="pipeline_run", help="Name for output folder (outputs/{run_name}/)")
+    parser.add_argument("--input_pdb", type=str, default=None, help="Path to input PDB file (default: outputs/{run_name}_{design_num}.pdb)")
     parser.add_argument("--contigs", type=str, default="20-20/0 R30-127/R138-336/R345-400")
     parser.add_argument("--num_seqs", type=int, default=16)
     parser.add_argument("--design_num", type=int, default=0)
@@ -281,10 +290,12 @@ def main():
     args = parser.parse_args()
 
     start = time.time()
+    pdb_file = args.input_pdb.strip() if (args.input_pdb and args.input_pdb.strip()) else None
     if args.use_alphafold:
         success = run_proteinmpnn_alphafold(
             run_name=args.run_name,
             contigs=args.contigs,
+            pdb_file=pdb_file,
             copies=args.copies,
             num_seqs=args.num_seqs,
             initial_guess=args.initial_guess,
@@ -299,6 +310,7 @@ def main():
         success = run_proteinmpnn_only(
             run_name=args.run_name,
             contigs=args.contigs,
+            pdb_file=pdb_file,
             copies=args.copies,
             num_seqs=args.num_seqs,
             initial_guess=args.initial_guess,

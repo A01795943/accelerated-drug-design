@@ -70,7 +70,8 @@ class RFdiffusionParams(BaseModel):
 
 
 class MPNNParams(BaseModel):
-    run_name: str = Field(default="pipeline_run", description="Must match step 1 run_name")
+    run_name: str = Field(default="pipeline_run", description="Name for output folder (outputs/{run_name}/)")
+    input_pdb: Optional[str] = Field(default=None, description="Path to input PDB (default: outputs/{run_name}_0.pdb)")
     contigs: str = "20-20/0 R30-127/R138-336/R345-400"
     num_seqs: int = 16
     design_num: int = 0
@@ -147,7 +148,7 @@ def run_rfdiffusion(params: RFdiffusionParams):
 
 @app.post("/run/mpnn")
 def run_mpnn(params: MPNNParams):
-    """Run step 2: ProteinMPNN sequence design. Reads {run_name}_0.pdb, writes to {run_name}/"""
+    """Run step 2: ProteinMPNN sequence design. Uses input_pdb if provided, else outputs/{run_name}_0.pdb"""
     args = [
         "--run_name", params.run_name,
         "--contigs", params.contigs,
@@ -156,6 +157,8 @@ def run_mpnn(params: MPNNParams):
         "--num_designs", str(params.num_designs),
         "--mpnn_sampling_temp", str(params.mpnn_sampling_temp),
     ]
+    if params.input_pdb and params.input_pdb.strip():
+        args.extend(["--input_pdb", params.input_pdb.strip()])
     if params.use_alphafold:
         args.append("--use_alphafold")
     if params.initial_guess:
