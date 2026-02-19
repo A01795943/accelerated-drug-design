@@ -1,89 +1,42 @@
+"""
+Step 2: ProteinMPNN sequence design (optional AlphaFold validation).
+Reads: /workspace/outputs/{run_name}_0.pdb
+Writes: /workspace/outputs/{run_name}/ (mpnn_results.csv, design.fasta, and optionally best.pdb etc.)
+"""
 import os
 import sys
 import subprocess
+import argparse
 import time
 
-start_time_total = time.time()
+sys.path.append("/workspace/RFdiffusion")
+sys.path.append("/workspace/colabdesign")
 
-# Configurar paths
-sys.path.append('/workspace/RFdiffusion')
-sys.path.append('/workspace/colabdesign')
+OUTPUTS_DIR = "/workspace/outputs"
 
-#############
-print("=" * 60)
-print("INFORMACIÓN DEL ENTORNO Y ARCHIVOS")
-print("=" * 60)
-print("Directorio actual:", os.getcwd())
 
-#############
-print("\n ARCHIVOS EN /workspace/outputs/ (VOLUMEN DOCKER):")
-try:
-    output_files = os.listdir('/workspace/outputs/')
-    for file in output_files:
-        file_path = f"/workspace/outputs/{file}"
-        if os.path.isfile(file_path):
-            size = os.path.getsize(file_path) / 1024
-            print(f"   - {file} ({size:.1f} KB)")
-        else:
-            print(f"   - {file}/ [carpeta]")
-except Exception as e:
-    print(f"   - Error: {e}")
-
-print("=" * 60)
-#############
-
-#############
-print("VERIFICANDO HARDWARE DISPONIBLE:")
-
-try:
-    import jax
-    print(f"   JAX devices: {jax.devices()}")
-    print(f"   JAX backend: {jax.default_backend()}")
-except Exception as e:
-    print(f"   Error JAX: {e}")
-
-try:
-    import torch
-    print(f"   PyTorch CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"   PyTorch GPU: {torch.cuda.get_device_name(0)}")
-except Exception as e:
-    print(f"   Error PyTorch: {e}")
-##############
-
-def run_proteinmpnn_alphafold(path, 
-                              contigs, 
-                              copies=1, 
-                              num_seqs=8, 
-                              initial_guess=False, 
-                              num_recycles=1,
-                              use_multimer=False, 
-                              rm_aa="C", 
-                              mpnn_sampling_temp=0.1, 
-                              num_designs=1,
-                              design_num=0):
-    """
-    Ejecuta ProteinMPNN para generar secuencias y AlphaFold para validar
-    """
-    
-    print("=" * 60)
-    print(" - PROTEINMPNN + ALPHAFOLD VALIDATION")
-    print("=" * 60)
-    
-    pdb_file = f"/workspace/outputs/{path}_{design_num}.pdb"
+def run_proteinmpnn_alphafold(
+    run_name: str,
+    contigs: str,
+    copies: int = 1,
+    num_seqs: int = 8,
+    initial_guess: bool = False,
+    num_recycles: int = 1,
+    use_multimer: bool = True,
+    rm_aa: str = "C",
+    mpnn_sampling_temp: float = 0.1,
+    num_designs: int = 1,
+    design_num: int = 0,
+) -> bool:
+    """Run ProteinMPNN + AlphaFold validation. Output to /workspace/outputs/{run_name}/."""
+    pdb_file = f"{OUTPUTS_DIR}/{run_name}_{design_num}.pdb"
     if not os.path.exists(pdb_file):
-        print(f" - No se encuentra el archivo PDB: {pdb_file}")
+        print(f"❌ No se encuentra el archivo PDB: {pdb_file}")
         return False
-    
-    # Convertir contigs a string
-    if isinstance(contigs, list):
-        contigs_str = ":".join(contigs)
-    else:
-        contigs_str = str(contigs)
-    
-    output_dir = f"/workspace/outputs/{path}"
-    
-    # Construir opciones
+
+    contigs_str = ":".join(contigs) if isinstance(contigs, list) else str(contigs)
+    output_dir = f"{OUTPUTS_DIR}/{run_name}"
+
     opts = [
         f"--pdb={pdb_file}",
         f"--loc={output_dir}",
@@ -93,70 +46,24 @@ def run_proteinmpnn_alphafold(path,
         f"--num_recycles={num_recycles}",
         f"--rm_aa={rm_aa}",
         f"--mpnn_sampling_temp={mpnn_sampling_temp}",
-        f"--num_designs={num_designs}"
+        f"--num_designs={num_designs}",
     ]
-    
     if initial_guess:
         opts.append("--initial_guess")
     if use_multimer:
         opts.append("--use_multimer")
-    
-    # Construir comando
-    cmd = ['python3', '/workspace/colabdesign/rf/designability_test.py'] + opts
-    
-    print("PARÁMETROS:")
+
+    cmd = ["python3", "/workspace/colabdesign/rf/designability_test.py"] + opts
+    print("=" * 60)
+    print(" PROTEINMPNN + ALPHAFOLD VALIDATION")
+    print("=" * 60)
     print(f"   PDB: {pdb_file}")
     print(f"   Output: {output_dir}")
-    print(f"   Contigs: {contigs_str}")
-    print(f"   Secuencias: {num_seqs}")
-    print(f"   Recycles: {num_recycles}")
     print("=" * 60)
-    
-    # Ejecutar
-    print("Ejecutando ProteinMPNN + AlphaFold...\n\n")
-    start_time = time.time()
-    
+
     try:
-        original_cwd = os.getcwd()
-        os.chdir('/workspace')
-        
-        result = subprocess.run(cmd, check=True)
-        end_time = time.time()
-        
-        print(f"Validación completada en {end_time - start_time:.1f}s")
-        
-        expected_files = [
-            f"{output_dir}/mpnn_results.csv",      # Este sí existe
-            f"{output_dir}/best.pdb",              # Mejor diseño
-            f"{output_dir}/best_design0.pdb",      # Mejor diseño alternativo
-            f"{output_dir}/design.fasta",          # Secuencias
-            f"{output_dir}/scores.json",           # Scores
-            f"{output_dir}/af_pred.pdb",           # Predicción AlphaFold
-            f"{output_dir}/seq.fasta"              # Secuencias alternativo
-        ]
-        
-        print("ARCHIVOS GENERADOS:")
-        files_found = []
-        for file_path in expected_files:
-            if os.path.exists(file_path):
-                file_size = os.path.getsize(file_path) / 1024
-                print(f" {os.path.basename(file_path)} ({file_size:.1f} KB)")
-                files_found.append(file_path)
-        
-        # Si no se encontraron archivos, mostrar todos los que hay
-        if not files_found:
-            print("Buscando todos los archivos en la carpeta...")
-            if os.path.exists(output_dir):
-                all_files = os.listdir(output_dir)
-                for file in sorted(all_files):
-                    full_path = os.path.join(output_dir, file)
-                    if os.path.isfile(full_path):
-                        file_size = os.path.getsize(full_path) / 1024
-                        print(f"  {file} ({file_size:.1f} KB)")
-        
-        os.chdir(original_cwd)
+        result = subprocess.run(cmd, cwd="/workspace", check=True)
         return True
-        
     except subprocess.CalledProcessError as e:
         print(f"Error: {e}")
         return False
@@ -165,39 +72,28 @@ def run_proteinmpnn_alphafold(path,
         return False
 
 
-def run_proteinmpnn_only(path, 
-                        contigs, 
-                        copies=1, 
-                        num_seqs=8, 
-                        initial_guess=False,
-                        num_recycles=1,
-                        use_multimer=False, 
-                        rm_aa="C", 
-                        mpnn_sampling_temp=0.1, 
-                        num_designs=1,
-                        design_num=0):
-    """
-    Ejecuta SOLAMENTE ProteinMPNN para generar secuencias sin validación con AlphaFold
-    """
-    
-    print("=" * 60)
-    print(" PROTEINMPNN ONLY (SIN ALPHAFOLD)")
-    print("=" * 60)
-    
-    pdb_file = f"/workspace/outputs/{path}_{design_num}.pdb"
+def run_proteinmpnn_only(
+    run_name: str,
+    contigs: str,
+    copies: int = 1,
+    num_seqs: int = 8,
+    initial_guess: bool = False,
+    num_recycles: int = 1,
+    use_multimer: bool = True,
+    rm_aa: str = "C",
+    mpnn_sampling_temp: float = 0.1,
+    num_designs: int = 1,
+    design_num: int = 0,
+) -> bool:
+    """Run ProteinMPNN only (no AlphaFold). Output to /workspace/outputs/{run_name}/."""
+    pdb_file = f"{OUTPUTS_DIR}/{run_name}_{design_num}.pdb"
     if not os.path.exists(pdb_file):
-        print(f"No se encuentra el archivo PDB: {pdb_file}")
+        print(f"❌ No se encuentra el archivo PDB: {pdb_file}")
         return False
-    
-    # Convertir contigs a string
-    if isinstance(contigs, list):
-        contigs_str = ":".join(contigs)
-    else:
-        contigs_str = str(contigs)
-    
-    output_dir = f"/workspace/outputs/{path}_mpnn_only"
-    
-    # Crear script temporal que solo ejecuta MPNN
+
+    contigs_str = ":".join(contigs) if isinstance(contigs, list) else str(contigs)
+    output_dir = f"{OUTPUTS_DIR}/{run_name}"
+
     mpnn_only_script = """
 import os
 import sys
@@ -227,7 +123,6 @@ def get_info(contig):
             free_chain = True
     return F,[fixed_chain,free_chain]
 
-# Parámetros
 pdb_filename = "{pdb_file}"
 output_dir = "{output_dir}"
 contigs_str = "{contigs_str}"
@@ -239,14 +134,9 @@ rm_aa = "{rm_aa}"
 sampling_temp = {sampling_temp}
 num_designs = {num_designs}
 
-# VALIDACIÓN DE ARGUMENTOS REQUERIDOS 
-if None in [pdb_filename, output_dir, contigs_str]:
-    print(" Missing Required Arguments: pdb, loc, contigs")
-    sys.exit(1)
 if rm_aa == "":
     rm_aa = None
 
-# Parse contigs
 contigs = []
 for contig_str in contigs_str.replace(" ",":").replace(",",":").split(":"):
     if len(contig_str) > 0:
@@ -268,7 +158,6 @@ for pos,(fixed_chain,free_chain) in info:
     free_chains += [free_chain and not fixed_chain]
     both_chains += [fixed_chain and free_chain]
 
-# Preparar modelo AF solo para estructura 
 flags = {{"initial_guess":initial_guess,
         "best_metric":"rmsd",
         "use_multimer":use_multimer,
@@ -286,12 +175,11 @@ if sum(both_chains) == 0 and sum(fixed_chains) > 0 and sum(free_chains) > 0:
     prep_flags = {{"target_chain":",".join(target_chains),
                 "binder_chain":",".join(binder_chains),
                 "rm_aa":rm_aa}}
-                
+
 elif sum(fixed_pos) > 0:
     protocol = "partial"
     print("protocol=partial")
-    af_model = mk_af_model(protocol="fixbb", 
-                           use_templates=True, **flags)
+    af_model = mk_af_model(protocol="fixbb", use_templates=True, **flags)
     rm_template = np.array(fixed_pos) == 0
     prep_flags = {{"chain":",".join(chains),
                  "rm_template":rm_template,
@@ -308,40 +196,30 @@ else:
                  "homooligomer":copies>1,
                  "rm_aa":rm_aa}}
 
-# Ejecutar solo MPNN
-
 batch_size = 8
-if num_seqs < batch_size:    
+if num_seqs < batch_size:
     batch_size = num_seqs
 
 print("Running ProteinMPNN only...")
-
 mpnn_model = mk_mpnn_model()
 os.makedirs(output_dir, exist_ok=True)
 data = []
 
 with open(f"{output_dir}/design.fasta", "w") as fasta:
     for m in range(num_designs):
-        if num_designs == 0:
-            current_pdb = pdb_filename
-        else:
-            current_pdb = pdb_filename.replace("_0.pdb", f"_{{m}}.pdb")
-        
+        current_pdb = pdb_filename if num_designs == 0 else pdb_filename.replace("_0.pdb", f"_{{m}}.pdb")
         af_model.prep_inputs(current_pdb, **prep_flags)
         if protocol == "partial":
             p = np.where(fixed_pos)[0]
             af_model.opt["fix_pos"] = p[p < af_model._len]
         mpnn_model.get_af_inputs(af_model)
         out = mpnn_model.sample(num=num_seqs//batch_size, batch=batch_size, temperature=sampling_temp)
-        
         for n in range(num_seqs):
             score_line = [f'design:{{m}} n:{{n}}', f'mpnn_score:{{out["score"][n]:.3f}}']
             line = f'>{{"|".join(score_line)}}\\n{{out["seq"][n]}}'
             fasta.write(line + "\\n")
-            print(f"design:{{m}} n:{{n}} mpnn_score:{{out['score'][n]:.3f}} {{out['seq'][n]}}")
             data.append([m, n, out["score"][n], out["seq"][n]])
 
-# Guardar resultados MPNN
 df = pd.DataFrame(data, columns=["design", "n", "score", "seq"])
 df.to_csv(f'{output_dir}/mpnn_results.csv')
 print(f"MPNN only completed. Results saved to {output_dir}")
@@ -355,96 +233,87 @@ print(f"MPNN only completed. Results saved to {output_dir}")
         use_multimer=str(use_multimer),
         rm_aa=rm_aa,
         sampling_temp=mpnn_sampling_temp,
-        num_designs=num_designs
+        num_designs=num_designs,
     )
-    
-    # Guardar script temporal
+
     temp_script_path = "/tmp/mpnn_only.py"
     with open(temp_script_path, "w") as f:
         f.write(mpnn_only_script)
-    
-    print("PARÁMETROS MPNN ONLY:")
+
+    print("=" * 60)
+    print(" PROTEINMPNN ONLY (SIN ALPHAFOLD)")
+    print("=" * 60)
     print(f"   PDB: {pdb_file}")
     print(f"   Output: {output_dir}")
-    print(f"   Contigs: {contigs_str}")
-    print(f"   Secuencias: {num_seqs}")
-    print(f"   Initial guess: {initial_guess}")
-    print(f"   Use multimer: {use_multimer}")
-    print(f"   Sampling temp: {mpnn_sampling_temp}")
     print("=" * 60)
-    
-    # Ejecutar script temporal
-    print("Ejecutando ProteinMPNN (sin AlphaFold)...")
-    start_time = time.time()
-    
+
     try:
-        result = subprocess.run(['python3', temp_script_path], check=True, capture_output=True, text=True)
-        end_time = time.time()
-        
-        print(f"ProteinMPNN completado en {end_time - start_time:.1f}s")
-        
-        # Verificar archivos generados
-        expected_files = [
-            f"{output_dir}/design.fasta",
-            f"{output_dir}/mpnn_results.csv",
-        ]
-        
-        print("ARCHIVOS GENERADOS POR MPNN:")
-        for file_path in expected_files:
-            if os.path.exists(file_path):
-                file_size = os.path.getsize(file_path) / 1024
-                print(f"   SÍ: {os.path.basename(file_path)} ({file_size:.1f} KB)")
-            else:
-                print(f"   NO: {os.path.basename(file_path)} (no encontrado)")
-        
-        # Limpiar script temporal
-        os.remove(temp_script_path)
+        result = subprocess.run(["python3", temp_script_path], check=True, capture_output=True, text=True, cwd="/workspace")
+        if os.path.exists(temp_script_path):
+            os.remove(temp_script_path)
         return True
-        
     except subprocess.CalledProcessError as e:
         print(f"Error ejecutando MPNN: {e}")
-        print(f"STDOUT: {e.stdout}")
-        print(f"STDERR: {e.stderr}")
+        if e.stdout:
+            print(f"STDOUT: {e.stdout}")
+        if e.stderr:
+            print(f"STDERR: {e.stderr}")
         return False
     except Exception as e:
         print(f"Error inesperado: {e}")
         return False
 
-## EJECUCIÓN PRINCIPAL
-#if __name__ == "__main__":    
-#    # Ejecutar validación
-#    run_proteinmpnn_alphafold(
-#        path="T16B3J_R_KB_HS_KB",
-#        contigs="20-20/0 R30-127/R138-336/R345-400",
-#        copies=1,
-#        num_seqs=8,
-#        initial_guess=False,
-#        num_recycles=1,
-#        use_multimer=True,
-#        rm_aa="C",
-#        mpnn_sampling_temp=0.1,
-#        num_designs=1,
-#        design_num=0
-#    )
 
-# EJECUCION MPNN
-if __name__ == "__main__":    
-    # OPCIÓN 1: Ejecutar solo MPNN
-    run_proteinmpnn_only(
-        path="T16B3J_R_KB_HS_KB",
-        contigs="20-20/0 R30-127/R138-336/R345-400",
-        copies=1,
-        num_seqs=1200,
-        initial_guess=False,
-        num_recycles=1,
-        use_multimer=True,
-        rm_aa="C",
-        mpnn_sampling_temp=0.1,
-        num_designs=1,
-        design_num=0
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Step 2: ProteinMPNN sequence design")
+    parser.add_argument("--run_name", type=str, default="pipeline_run", help="Must match step 1 run_name")
+    parser.add_argument("--contigs", type=str, default="20-20/0 R30-127/R138-336/R345-400")
+    parser.add_argument("--num_seqs", type=int, default=16)
+    parser.add_argument("--design_num", type=int, default=0)
+    parser.add_argument("--use_alphafold", action="store_true", help="Run MPNN + AlphaFold validation")
+    parser.add_argument("--copies", type=int, default=1)
+    parser.add_argument("--initial_guess", action="store_true")
+    parser.add_argument("--num_recycles", type=int, default=1)
+    parser.add_argument("--use_multimer", action="store_true", default=True)
+    parser.add_argument("--rm_aa", type=str, default="C")
+    parser.add_argument("--mpnn_sampling_temp", type=float, default=0.1)
+    parser.add_argument("--num_designs", type=int, default=1)
+    args = parser.parse_args()
 
-end_time_total = time.time()
-print("=" * 60)
-print(f"TIEMPO TOTAL DE EJECUCIÓN: {end_time_total - start_time_total:.2f} segundos")
-print("=" * 60)
+    start = time.time()
+    if args.use_alphafold:
+        success = run_proteinmpnn_alphafold(
+            run_name=args.run_name,
+            contigs=args.contigs,
+            copies=args.copies,
+            num_seqs=args.num_seqs,
+            initial_guess=args.initial_guess,
+            num_recycles=args.num_recycles,
+            use_multimer=args.use_multimer,
+            rm_aa=args.rm_aa,
+            mpnn_sampling_temp=args.mpnn_sampling_temp,
+            num_designs=args.num_designs,
+            design_num=args.design_num,
+        )
+    else:
+        success = run_proteinmpnn_only(
+            run_name=args.run_name,
+            contigs=args.contigs,
+            copies=args.copies,
+            num_seqs=args.num_seqs,
+            initial_guess=args.initial_guess,
+            num_recycles=args.num_recycles,
+            use_multimer=args.use_multimer,
+            rm_aa=args.rm_aa,
+            mpnn_sampling_temp=args.mpnn_sampling_temp,
+            num_designs=args.num_designs,
+            design_num=args.design_num,
+        )
+    print("=" * 60)
+    print(f"TIEMPO TOTAL: {time.time() - start:.2f} segundos")
+    print("=" * 60)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -95,8 +95,14 @@ RUN pip install --upgrade --force-reinstall "jax[cuda12]" -f https://storage.goo
 # Crear directorio de outputs
 RUN mkdir -p outputs
 
-# Mensaje de confirmación
-CMD echo "RFdiffusion environment COMPLETELY READY!" && \
-    echo "JAX installed with GPU support" && \
-    echo "To run: docker run -it --gpus all -v /host/outputs:/workspace/outputs rfdiffusion bash" && \
-    python3 -c "import jax; print(f'JAX devices: {jax.devices()}')"
+# Copy repo into container (build from repo root: docker build -f notebooks/Dockerfile -t rfdiffusion .)
+COPY . /workspace/repo
+
+# REST API for pipeline
+RUN pip3 install "fastapi[standard]" uvicorn
+
+EXPOSE 8000
+WORKDIR /workspace/repo/notebooks
+
+# Start API by default; override with: docker run -it ... bash
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
