@@ -32,13 +32,18 @@ def quitar_cadena(pdb_file, cadena_a_quitar):
 
 
 def download_pdb(pdb_id, remove_chain=None):
-    """Download PDB from RCSB; optionally remove a chain."""
+    """Download PDB from RCSB; optionally remove a chain. Saves to OUTPUTS_DIR."""
     if not pdb_id or len(pdb_id) != 4:
         return pdb_id
-    pdb_file = f"/workspace/RFdiffusion/{pdb_id}.pdb"
+    
+    # Ensure OUTPUTS_DIR exists
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    
+    pdb_file = os.path.join(OUTPUTS_DIR, f"{pdb_id}.pdb")
     if os.path.exists(pdb_file):
         print(f"✅ PDB encontrado: {pdb_file}")
         return pdb_file
+    
     print(f"📥 Descargando {pdb_id} desde RCSB...")
     try:
         url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
@@ -48,7 +53,7 @@ def download_pdb(pdb_id, remove_chain=None):
                 f.write(response.text)
             print(f"✅ PDB descargado: {pdb_file}")
             if remove_chain is not None:
-                original_file = f"/workspace/RFdiffusion/{pdb_id}_ORIGINAL.pdb"
+                original_file = os.path.join(OUTPUTS_DIR, f"{pdb_id}_ORIGINAL.pdb")
                 shutil.copy2(pdb_file, original_file)
                 print(f"✅ Copia original guardada: {original_file}")
                 pdb_file = quitar_cadena(pdb_file, remove_chain)
@@ -145,18 +150,20 @@ def run_rfdiffusion(
                 dst = f"{OUTPUTS_DIR}/{run_name}_{i}.pdb"
                 shutil.copy2(src, dst)
                 print(f"✅ Copiado: {dst}")
-        # Optional: copy original/sin_P for reference
+        # Optional: copy original/sin_P for reference (already in OUTPUTS_DIR if downloaded)
         if pdb and len(pdb) == 4:
-            if os.path.exists(f"/workspace/RFdiffusion/{pdb}_ORIGINAL.pdb"):
-                shutil.copy2(
-                    f"/workspace/RFdiffusion/{pdb}_ORIGINAL.pdb",
-                    f"{OUTPUTS_DIR}/{pdb}_ORIGINAL.pdb",
-                )
-            if os.path.exists(f"/workspace/RFdiffusion/{pdb}.pdb"):
-                shutil.copy2(
-                    f"/workspace/RFdiffusion/{pdb}.pdb",
-                    f"{OUTPUTS_DIR}/{pdb}_SIN_P.pdb",
-                )
+            # Check OUTPUTS_DIR first (new location), then fallback to old location
+            original_src = os.path.join(OUTPUTS_DIR, f"{pdb}_ORIGINAL.pdb")
+            if not os.path.exists(original_src):
+                original_src = f"/workspace/RFdiffusion/{pdb}_ORIGINAL.pdb"
+            if os.path.exists(original_src) and not os.path.exists(os.path.join(OUTPUTS_DIR, f"{pdb}_ORIGINAL.pdb")):
+                shutil.copy2(original_src, os.path.join(OUTPUTS_DIR, f"{pdb}_ORIGINAL.pdb"))
+            
+            pdb_src = os.path.join(OUTPUTS_DIR, f"{pdb}.pdb")
+            if not os.path.exists(pdb_src):
+                pdb_src = f"/workspace/RFdiffusion/{pdb}.pdb"
+            if os.path.exists(pdb_src) and not os.path.exists(os.path.join(OUTPUTS_DIR, f"{pdb}_SIN_P.pdb")):
+                shutil.copy2(pdb_src, os.path.join(OUTPUTS_DIR, f"{pdb}_SIN_P.pdb"))
     else:
         print(f"Error: Código {result.returncode}")
 
