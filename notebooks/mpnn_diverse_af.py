@@ -139,6 +139,7 @@ def main():
 
     data = []
     best = {"rmsd": np.inf, "n": 0}
+    available_terms = None
 
     print("running proteinMPNN (diverse seeds)...")
     print("running AlphaFold...")
@@ -166,14 +167,18 @@ def main():
 
             row = {"design": 0, "n": n, "mpnn": score}
             for t in af_terms:
+                if t not in af_model.aux.get("log", {}):
+                    continue
                 val = af_model.aux["log"][t]
                 if t in ("i_pae", "pae"):
                     val = val * 31
                 row[t] = val
             row["seq"] = seq
+            if n == 0:
+                available_terms = [t for t in af_terms if t in row]
             data.append(row)
 
-            rmsd = row["rmsd"]
+            rmsd = row.get("rmsd", np.inf)
             if rmsd < best["rmsd"]:
                 best = {"rmsd": rmsd, "n": n}
 
@@ -181,8 +186,9 @@ def main():
             af_model._save_results(save_best=True, verbose=False)
             af_model._k += 1
 
+            terms_for_row = available_terms if available_terms is not None else [t for t in af_terms if t in row]
             score_line = [f"design:0 n:{n}", f"mpnn:{score:.3f}"]
-            for t in af_terms:
+            for t in terms_for_row:
                 score_line.append(f"{t}:{row[t]:.3f}")
             print(" ".join(score_line) + " " + (seq[:80] + "..." if len(seq) > 80 else seq))
 
@@ -195,7 +201,7 @@ def main():
         with open(f"{args.loc}/all_pdb/design0_n{best['n']}.pdb", "r") as r:
             f.write(r.read())
 
-    labels = ["design", "n", "mpnn"] + af_terms + ["seq"]
+    labels = ["design", "n", "mpnn"] + (available_terms or [t for t in af_terms if t in (data[0] if data else {})]) + ["seq"]
     df = pd.DataFrame(data, columns=labels)
     df.to_csv(f"{args.loc}/mpnn_results.csv", index=False)
     print(f"Saved {args.loc}/mpnn_results.csv and design.fasta with {len(data)} diverse sequences + AF metrics.")
