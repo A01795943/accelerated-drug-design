@@ -57,9 +57,14 @@ def run_proteinmpnn_alphafold(
     if use_multimer:
         opts.append("--use_multimer")
 
-    cmd = ["python3", "/workspace/colabdesign/rf/designability_test.py"] + opts
+    # Use diverse MPNN + AF (different sequence per seed) instead of designability_test
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mpnn_diverse_af_script = os.path.join(script_dir, "mpnn_diverse_af.py")
+    if not os.path.exists(mpnn_diverse_af_script):
+        mpnn_diverse_af_script = "/workspace/repo/notebooks/mpnn_diverse_af.py"
+    cmd = ["python3", mpnn_diverse_af_script] + opts
     print("=" * 60)
-    print(" PROTEINMPNN + ALPHAFOLD VALIDATION")
+    print(" PROTEINMPNN + ALPHAFOLD VALIDATION (diverse sequences)")
     print("=" * 60)
     print(f"   PDB: {pdb_file}")
     print(f"   Output: {output_dir}")
