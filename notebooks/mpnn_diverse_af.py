@@ -5,11 +5,11 @@ Usage: python3 mpnn_diverse_af.py --pdb=... --loc=... --contig=... [--num_seqs=8
 """
 import os
 import sys
-import random
 import argparse
 
 import numpy as np
 import pandas as pd
+import jax
 
 # ColabDesign must be on path (caller sets cwd=/workspace and path)
 sys.path.insert(0, "/workspace/colabdesign")
@@ -141,26 +141,18 @@ def main():
     best = {"rmsd": np.inf, "n": 0}
     available_terms = None
 
-    print("running proteinMPNN (diverse seeds)...")
-    print("running AlphaFold...")
+    print("running proteinMPNN (one batch for diversity)...")
+    # Single sample call with batch=num_seqs: ColabDesign splits one key into batch keys internally, giving different sequences
+    key = jax.random.PRNGKey(42)
+    out = mpnn_model.sample(num=1, batch=args.num_seqs, temperature=args.mpnn_sampling_temp, key=key)
+    seqs = out["seq"]
+    scores = out["score"]
 
+    print("running AlphaFold...")
     with open(f"{args.loc}/design.fasta", "w") as fasta:
         for n in range(args.num_seqs):
-            # Different seed per sequence so we get different designs
-            seed = n * 12345 + 42
-            random.seed(seed)
-            np.random.seed(seed)
-            try:
-                import torch
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
-            except Exception:
-                pass
-
-            out = mpnn_model.sample(num=1, batch=1, temperature=args.mpnn_sampling_temp)
-            seq = out["seq"][0]
-            score = out["score"][0]
+            seq = seqs[n] if hasattr(seqs[n], "strip") else str(seqs[n])
+            score = float(np.asarray(scores)[n])
 
             sub_seq = seq.replace("/", "")[-af_model._len:]
             af_model.predict(seq=sub_seq, num_recycles=args.num_recycles, verbose=False)
