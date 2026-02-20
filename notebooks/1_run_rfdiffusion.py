@@ -150,7 +150,7 @@ def run_rfdiffusion(
                 dst = f"{OUTPUTS_DIR}/{run_name}_{i}.pdb"
                 shutil.copy2(src, dst)
                 print(f"✅ Copiado: {dst}")
-        # Optional: copy original/sin_P for reference (already in OUTPUTS_DIR if downloaded)
+        # Optional: copy original/sin_{chain_to_remove} for reference (already in OUTPUTS_DIR if downloaded)
         if pdb and len(pdb) == 4:
             # Check OUTPUTS_DIR first (new location), then fallback to old location
             original_src = os.path.join(OUTPUTS_DIR, f"{pdb}_ORIGINAL.pdb")
@@ -162,8 +162,8 @@ def run_rfdiffusion(
             pdb_src = os.path.join(OUTPUTS_DIR, f"{pdb}.pdb")
             if not os.path.exists(pdb_src):
                 pdb_src = f"/workspace/RFdiffusion/{pdb}.pdb"
-            if os.path.exists(pdb_src) and not os.path.exists(os.path.join(OUTPUTS_DIR, f"{pdb}_SIN_P.pdb")):
-                shutil.copy2(pdb_src, os.path.join(OUTPUTS_DIR, f"{pdb}_SIN_P.pdb"))
+            if os.path.exists(pdb_src) and not os.path.exists(os.path.join(OUTPUTS_DIR, f"{pdb}_SIN_{chain_to_remove}.pdb")):
+                shutil.copy2(pdb_src, os.path.join(OUTPUTS_DIR, f"{pdb}_SIN_{chain_to_remove}.pdb"))
     else:
         print(f"Error: Código {result.returncode}")
 
@@ -176,12 +176,12 @@ def run_rfdiffusion(
 def main():
     parser = argparse.ArgumentParser(description="Step 1: RFdiffusion backbone generation")
     parser.add_argument("--run_name", type=str, default="pipeline_run", help="Job/run name (used for outputs)")
-    parser.add_argument("--contigs", type=str, default="12-15/0 R311-337")
-    parser.add_argument("--pdb", type=str, default="6B3J")
+    parser.add_argument("--contigs", type=str, default="20-35/0 A19-127")
+    parser.add_argument("--pdb", type=str, default="4Z18")
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--num_designs", type=int, default=1)
-    parser.add_argument("--hotspot", type=str, default="R312,R313,R314,R315")
-    parser.add_argument("--chain_to_remove", type=str, default="P", help="Chain to remove from PDB (empty = none)")
+    parser.add_argument("--hotspot", type=str, default="A54,A56,A58,A66,A113,A115,A123,A124,A125")
+    parser.add_argument("--chain_to_remove", type=str, default="B", help="Chain to remove from PDB (empty = none)")
     parser.add_argument("--symmetry", type=str, default="")
     parser.add_argument("--symmetry_order", type=str, default="")
     parser.add_argument("--chains", type=str, default="")
