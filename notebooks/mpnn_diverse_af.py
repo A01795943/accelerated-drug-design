@@ -9,7 +9,6 @@ import argparse
 
 import numpy as np
 import pandas as pd
-import jax
 
 # ColabDesign must be on path (caller sets cwd=/workspace and path)
 sys.path.insert(0, "/workspace/colabdesign")
@@ -125,7 +124,6 @@ def main():
     else:
         af_terms = ["plddt", "ptm", "pae", "rmsd"]
 
-    mpnn_model = mk_mpnn_model()
     os.makedirs(args.loc, exist_ok=True)
     os.makedirs(f"{args.loc}/all_pdb", exist_ok=True)
 
@@ -135,24 +133,28 @@ def main():
     if protocol == "partial":
         p = np.where(fixed_pos)[0]
         af_model.opt["fix_pos"] = p[p < af_model._len]
-    mpnn_model.get_af_inputs(af_model)
 
     data = []
     best = {"rmsd": np.inf, "n": 0}
     available_terms = None
 
-    print("running proteinMPNN (one batch for diversity)...")
-    # Single sample call with batch=num_seqs: ColabDesign splits one key into batch keys internally, giving different sequences
-    key = jax.random.PRNGKey(42)
-    out = mpnn_model.sample(num=1, batch=args.num_seqs, temperature=args.mpnn_sampling_temp, key=key)
-    seqs = out["seq"]
-    scores = out["score"]
+    # Step 1: generate N different sequences (one MPNN model per seed so we get distinct sequences)
+    print("running proteinMPNN (one model per seed for diversity)...")
+    seqs = []
+    scores = []
+    for n in range(args.num_seqs):
+        mpnn_model = mk_mpnn_model(seed=n * 12345 + 42)
+        mpnn_model.get_af_inputs(af_model)
+        out = mpnn_model.sample(num=1, batch=1, temperature=args.mpnn_sampling_temp)
+        seqs.append(out["seq"][0])
+        scores.append(float(np.asarray(out["score"])[0]))
 
+    # Step 2: run AlphaFold on each sequence
     print("running AlphaFold...")
     with open(f"{args.loc}/design.fasta", "w") as fasta:
         for n in range(args.num_seqs):
             seq = seqs[n] if hasattr(seqs[n], "strip") else str(seqs[n])
-            score = float(np.asarray(scores)[n])
+            score = scores[n]
 
             sub_seq = seq.replace("/", "")[-af_model._len:]
             af_model.predict(seq=sub_seq, num_recycles=args.num_recycles, verbose=False)
