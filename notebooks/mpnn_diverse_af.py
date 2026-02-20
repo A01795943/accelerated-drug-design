@@ -125,7 +125,7 @@ def main():
     else:
         af_terms = ["plddt", "ptm", "pae", "rmsd"]
 
-    mpnn_model = mk_mpnn_model(weights="original")
+    mpnn_model = mk_mpnn_model()
     os.makedirs(args.loc, exist_ok=True)
     os.makedirs(f"{args.loc}/all_pdb", exist_ok=True)
 
