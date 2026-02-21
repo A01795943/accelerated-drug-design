@@ -104,5 +104,5 @@ RUN pip3 install "fastapi[standard]" uvicorn
 EXPOSE 8000
 WORKDIR /workspace/repo/notebooks
 
-# Start API by default; override with: docker run -it ... bash
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start API by default (python3 -m so uvicorn is found); override with: docker run -it ... bash
+CMD ["python3", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

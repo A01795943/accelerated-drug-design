@@ -153,8 +153,11 @@ def run_rfdiffusion(
 
     if result.returncode == 0:
         # Copy from /dev/shm (or RFdiffusion/outputs) to /workspace/outputs for persistence
+        # RFdiffusion uses output_prefix=outputs/{run_name}, so files may be under /dev/shm/outputs/
         for i in range(num_designs):
             candidates = [
+                f"/dev/shm/outputs/{run_name}_{i}.pdb",
+                f"/dev/shm/outputs/{run_name}.pdb" if num_designs == 1 and i == 0 else None,
                 f"/dev/shm/{run_name}_{i}.pdb",
                 f"/dev/shm/{run_name}.pdb" if num_designs == 1 and i == 0 else None,
                 f"/workspace/RFdiffusion/outputs/{run_name}_{i}.pdb",
