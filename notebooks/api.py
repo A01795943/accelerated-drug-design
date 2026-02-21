@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 app = FastAPI(
@@ -72,6 +72,36 @@ def init_run_status_db() -> None:
                 conn.commit()
             except sqlite3.OperationalError:
                 pass
+        # MPNN results tables (summary + detail for completed runs)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mpnn_run_summary (
+                run_id TEXT PRIMARY KEY,
+                param_details TEXT,
+                fasta_content TEXT,
+                best_pdb_content TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mpnn_run_detail (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                design INTEGER,
+                mpnn REAL,
+                plddt REAL,
+                ptm REAL,
+                i_ptm REAL,
+                pae REAL,
+                rmsd REAL,
+                seq TEXT,
+                pdb_path TEXT,
+                created_at TEXT,
+                FOREIGN KEY (run_id) REFERENCES mpnn_run_summary(run_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mpnn_run_detail_run_id ON mpnn_run_detail(run_id)")
+        conn.commit()
 
 
 def run_status_exists(run_id: str, task: str) -> bool:
@@ -144,6 +174,51 @@ def run_status_get(run_id: str, task: str) -> Optional[dict]:
             except (TypeError, json.JSONDecodeError):
                 pass
         return d
+
+
+BATCH_SIZE_MPNN = 50
+
+
+def mpnn_summary_get(run_id: str) -> Optional[dict]:
+    """Return mpnn_run_summary row for run_id, or None."""
+    path = get_run_status_db_path()
+    with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT run_id, param_details, fasta_content, best_pdb_content, created_at FROM mpnn_run_summary WHERE run_id = ?",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("param_details"):
+            try:
+                d["param_details"] = json.loads(d["param_details"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return d
+
+
+def mpnn_detail_count(run_id: str) -> int:
+    """Return number of detail rows for run_id."""
+    path = get_run_status_db_path()
+    with sqlite3.connect(str(path)) as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM mpnn_run_detail WHERE run_id = ?", (run_id,))
+        return cur.fetchone()[0]
+
+
+def mpnn_detail_get_batch(run_id: str, batch: int, batch_size: int = BATCH_SIZE_MPNN) -> list[dict]:
+    """Return one batch of mpnn_run_detail rows for run_id (0-based batch index)."""
+    path = get_run_status_db_path()
+    offset = batch * batch_size
+    with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT id, run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_path, created_at FROM mpnn_run_detail WHERE run_id = ? ORDER BY n LIMIT ? OFFSET ?",
+            (run_id, batch_size, offset),
+        )
+        return [dict(row) for row in cur.fetchall()]
 
 
 def run_script(script: Path, args: list[str], timeout: int = STEP_TIMEOUT) -> tuple[int, str, str]:
@@ -371,12 +446,32 @@ def run_mpnn(params: MPNNParams):
 
 
 @app.get("/run/mpnn/status/{run_id}")
-def mpnn_status(run_id: str):
-    """Get MPNN+RF_DIFFUSION run status by run_id. When COMPLETED, includes output_csv and output_fasta (CSV and FASTA content); when ERROR, includes error_details."""
+def mpnn_status(
+    run_id: str,
+    batch: int = Query(0, ge=0, description="Detail batch index (0-based). Only used when status is COMPLETED."),
+):
+    """Get MPNN+RF_DIFFUSION run status by run_id. When COMPLETED, returns summary (params, fasta, best PDB), pagination info (total_records, total_batches, batch_size), and one batch of detail records. Use ?batch=N to fetch the N-th batch of 50 detail rows. When RUNNING or ERROR, returns status row only."""
     row = run_status_get(run_id, TASK_MPNN_RF_DIFFUSION)
     if row is None:
         raise HTTPException(status_code=404, detail=f"No run found for run_id '{run_id}'")
-    return row
+    if row.get("status") != STATUS_COMPLETED:
+        return row
+    summary = mpnn_summary_get(run_id)
+    total_records = mpnn_detail_count(run_id)
+    total_batches = (total_records + BATCH_SIZE_MPNN - 1) // BATCH_SIZE_MPNN if total_records else 0
+    batch_number = min(batch, max(0, total_batches - 1)) if total_batches else 0
+    detail = mpnn_detail_get_batch(run_id, batch_number, BATCH_SIZE_MPNN) if total_records else []
+    return {
+        **row,
+        "summary": summary or {},
+        "pagination": {
+            "total_records": total_records,
+            "total_batches": total_batches,
+            "batch_size": BATCH_SIZE_MPNN,
+        },
+        "batch_number": batch_number,
+        "detail": detail,
+    }
 
 
 @app.post("/run/rosetta")

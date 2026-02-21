@@ -2,13 +2,16 @@
 Step 2: ProteinMPNN sequence design (optional AlphaFold validation).
 Reads: /workspace/outputs/{run_name}_0.pdb
 Writes: /workspace/outputs/{run_name}/ (mpnn_results.csv, design.fasta, and optionally best.pdb etc.)
-When run_id and run_status_db are provided, updates run_status table (task MPNN+RF_DIFFUSION) on completion.
+When run_id and run_status_db are provided, updates run_status table (task MPNN+RF_DIFFUSION) on completion
+and saves results to mpnn_run_summary and mpnn_run_detail tables.
 """
+import csv
 import os
 import sys
 import subprocess
 import argparse
 import sqlite3
+import json
 import time
 from datetime import datetime, timezone
 
@@ -37,6 +40,136 @@ def update_run_status_mpnn(
             (status, error_details, output_csv, output_fasta, now, run_id, TASK_MPNN_RF_DIFFUSION),
         )
         conn.commit()
+
+
+def _ensure_mpnn_tables(conn: sqlite3.Connection) -> None:
+    """Create mpnn_run_summary and mpnn_run_detail if they do not exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mpnn_run_summary (
+            run_id TEXT PRIMARY KEY,
+            param_details TEXT,
+            fasta_content TEXT,
+            best_pdb_content TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mpnn_run_detail (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            n INTEGER NOT NULL,
+            design INTEGER,
+            mpnn REAL,
+            plddt REAL,
+            ptm REAL,
+            i_ptm REAL,
+            pae REAL,
+            rmsd REAL,
+            seq TEXT,
+            pdb_path TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mpnn_run_detail_run_id ON mpnn_run_detail(run_id)")
+
+
+def save_mpnn_results_to_db(
+    run_status_db: str,
+    run_id: str,
+    run_name: str,
+    output_dir: str,
+    args: argparse.Namespace,
+) -> None:
+    """Save completed MPNN run to mpnn_run_summary and mpnn_run_detail. Reads fasta, best.pdb, and CSV from output_dir."""
+    now = datetime.now(timezone.utc).isoformat()
+    fasta_content = None
+    fasta_path = os.path.join(output_dir, "design.fasta")
+    if os.path.isfile(fasta_path):
+        try:
+            with open(fasta_path, "r", encoding="utf-8") as f:
+                fasta_content = f.read()
+        except Exception:
+            pass
+    best_pdb_content = None
+    best_path = os.path.join(output_dir, "best.pdb")
+    if os.path.isfile(best_path):
+        try:
+            with open(best_path, "r", encoding="utf-8") as f:
+                best_pdb_content = f.read()
+        except Exception:
+            pass
+    param_details = {
+        "run_name": run_name,
+        "contigs": getattr(args, "contigs", None),
+        "num_seqs": getattr(args, "num_seqs", None),
+        "use_alphafold": getattr(args, "use_alphafold", False),
+        "copies": getattr(args, "copies", None),
+        "num_recycles": getattr(args, "num_recycles", None),
+        "rm_aa": getattr(args, "rm_aa", None),
+        "mpnn_sampling_temp": getattr(args, "mpnn_sampling_temp", None),
+        "num_designs": getattr(args, "num_designs", None),
+        "design_num": getattr(args, "design_num", None),
+        "input_pdb": getattr(args, "input_pdb", None),
+    }
+    with sqlite3.connect(run_status_db) as conn:
+        _ensure_mpnn_tables(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO mpnn_run_summary (run_id, param_details, fasta_content, best_pdb_content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (run_id, json.dumps(param_details), fasta_content, best_pdb_content, now),
+        )
+        conn.commit()
+        csv_path = os.path.join(output_dir, "mpnn_results.csv")
+        if os.path.isfile(csv_path):
+            all_pdb_dir = os.path.join(output_dir, "all_pdb")
+            with open(csv_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    n_val = row.get("n")
+                    if n_val is None:
+                        continue
+                    try:
+                        n = int(n_val)
+                    except (TypeError, ValueError):
+                        continue
+                    design = None
+                    if "design" in row:
+                        try:
+                            design = int(row["design"])
+                        except (TypeError, ValueError):
+                            pass
+                    mpnn_val = row.get("mpnn") or row.get("score")
+                    mpnn = None
+                    if mpnn_val is not None:
+                        try:
+                            mpnn = float(mpnn_val)
+                        except (TypeError, ValueError):
+                            pass
+                    plddt = _float_or_none(row.get("plddt"))
+                    ptm = _float_or_none(row.get("ptm"))
+                    i_ptm = _float_or_none(row.get("i_ptm"))
+                    pae = _float_or_none(row.get("pae"))
+                    rmsd = _float_or_none(row.get("rmsd"))
+                    seq = row.get("seq")
+                    pdb_path = None
+                    if os.path.isdir(all_pdb_dir):
+                        candidate = os.path.join(all_pdb_dir, f"design0_n{n}.pdb")
+                        if os.path.isfile(candidate):
+                            pdb_path = candidate
+                    conn.execute(
+                        """INSERT INTO mpnn_run_detail (run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_path, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_path, now),
+                    )
+        conn.commit()
+
+
+def _float_or_none(val):
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def run_proteinmpnn_alphafold(
@@ -364,6 +497,10 @@ def main():
     if args.run_id and args.run_status_db and os.path.isfile(args.run_status_db):
         if success:
             output_dir = os.path.join(OUTPUTS_DIR, args.run_name)
+            try:
+                save_mpnn_results_to_db(args.run_status_db, args.run_id, args.run_name, output_dir, args)
+            except Exception as e:
+                print(f"Warning: could not save results to DB: {e}")
             output_csv = None
             csv_path = os.path.join(output_dir, "mpnn_results.csv")
             if os.path.isfile(csv_path):
