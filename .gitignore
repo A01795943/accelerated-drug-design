@@ -5,3 +5,6 @@ __pycache__/
 # VSCode
 .vscode/
 /data/traning_alphafold_predictor/
+
+# Rosseta 
+/notebooks/PyRosetta4.Release.python310.linux.release-387.tar.bz2
