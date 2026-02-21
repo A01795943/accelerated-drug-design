@@ -1,13 +1,17 @@
 """
 Step 1: RFdiffusion backbone generation.
 Outputs: /workspace/outputs/{run_name}_0.pdb (and optionally _1.pdb, ...)
+When run_id and run_status_db are provided, updates run_status table on completion (COMPLETED + output_pdbs or ERROR + error_details).
 """
+import json
 import os
 import sys
 import subprocess
 import argparse
+import sqlite3
 import time
 import shutil
+from datetime import datetime, timezone
 
 import torch
 import requests
@@ -16,6 +20,21 @@ sys.path.append("/workspace/RFdiffusion")
 
 OUTPUTS_DIR = "/workspace/outputs"
 RFDIFFUSION_SCRIPT = "/workspace/RFdiffusion/run_inference.py"
+TASK_RD_DIFFUSION = "RD_DIFFUSION"
+STATUS_COMPLETED = "COMPLETED"
+STATUS_ERROR = "ERROR"
+
+
+def update_run_status(run_status_db: str, run_id: str, status: str, error_details: str | None = None, output_pdbs: dict | None = None) -> None:
+    """Update run_status table: status, error_details, output_pdbs (JSON string), updated_at."""
+    now = datetime.now(timezone.utc).isoformat()
+    output_pdbs_str = json.dumps(output_pdbs) if output_pdbs else None
+    with sqlite3.connect(run_status_db) as conn:
+        conn.execute(
+            "UPDATE run_status SET status = ?, error_details = ?, output_pdbs = ?, updated_at = ? WHERE run_id = ? AND task = ?",
+            (status, error_details, output_pdbs_str, now, run_id, TASK_RD_DIFFUSION),
+        )
+        conn.commit()
 
 
 def quitar_cadena(pdb_file, cadena_a_quitar):
@@ -175,6 +194,8 @@ def run_rfdiffusion(
 
 def main():
     parser = argparse.ArgumentParser(description="Step 1: RFdiffusion backbone generation")
+    parser.add_argument("--run_id", type=str, default=None, help="If set, update run_status DB on completion")
+    parser.add_argument("--run_status_db", type=str, default="/workspace/outputs/run_status.db", help="Path to run_status SQLite DB")
     parser.add_argument("--run_name", type=str, default="pipeline_run", help="Job/run name (used for outputs)")
     parser.add_argument("--contigs", type=str, default="20-35/0 A19-127")
     parser.add_argument("--pdb", type=str, default="4Z18")
@@ -187,18 +208,34 @@ def main():
     parser.add_argument("--chains", type=str, default="")
     args = parser.parse_args()
     chain_to_remove = args.chain_to_remove if args.chain_to_remove else None
-    success = run_rfdiffusion(
-        run_name=args.run_name,
-        contigs=args.contigs,
-        pdb=args.pdb,
-        iterations=args.iterations,
-        num_designs=args.num_designs,
-        hotspot=args.hotspot,
-        chain_to_remove=chain_to_remove,
-        symmetry=args.symmetry,
-        symmetry_order=args.symmetry_order,
-        chains=args.chains,
-    )
+    success = False
+    try:
+        success = run_rfdiffusion(
+            run_name=args.run_name,
+            contigs=args.contigs,
+            pdb=args.pdb,
+            iterations=args.iterations,
+            num_designs=args.num_designs,
+            hotspot=args.hotspot,
+            chain_to_remove=chain_to_remove,
+            symmetry=args.symmetry,
+            symmetry_order=args.symmetry_order,
+            chains=args.chains,
+        )
+    except Exception as e:
+        if args.run_id and args.run_status_db and os.path.isfile(args.run_status_db):
+            update_run_status(args.run_status_db, args.run_id, STATUS_ERROR, error_details=str(e))
+        raise
+    if args.run_id and args.run_status_db and os.path.isfile(args.run_status_db):
+        if success:
+            output_pdbs = {}
+            for i in range(args.num_designs):
+                path = os.path.join(OUTPUTS_DIR, f"{args.run_name}_{i}.pdb")
+                if os.path.exists(path):
+                    output_pdbs[f"output_{i}"] = path
+            update_run_status(args.run_status_db, args.run_id, STATUS_COMPLETED, output_pdbs=output_pdbs)
+        else:
+            update_run_status(args.run_status_db, args.run_id, STATUS_ERROR, error_details="RFdiffusion exited with non-zero return code")
     sys.exit(0 if success else 1)
 
 

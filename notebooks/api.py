@@ -2,9 +2,12 @@
 REST API for the drug design pipeline.
 Run with: uvicorn api:app --host 0.0.0.0 --port 8000
 """
+import json
 import os
+import sqlite3
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -26,8 +29,96 @@ SCRIPT_RFDIFFUSION = NOTEBOOKS / "1_run_rfdiffusion.py"
 SCRIPT_MPNN = NOTEBOOKS / "2_run_mpnn_af.py"
 SCRIPT_ROSETTA = NOTEBOOKS / "3_run_rosetta.py"
 
+# Run status DB (file-based so child scripts can update it)
+RUN_STATUS_DB = OUTPUTS / "run_status.db"
+TASK_RD_DIFFUSION = "RD_DIFFUSION"
+STATUS_RUNNING = "RUNNING"
+STATUS_COMPLETED = "COMPLETED"
+STATUS_ERROR = "ERROR"
+
 # Default timeout for long-running steps (seconds)
 STEP_TIMEOUT = 7200
+
+
+def get_run_status_db_path() -> Path:
+    """Path to run status DB; ensure outputs dir exists."""
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    return RUN_STATUS_DB
+
+
+def init_run_status_db() -> None:
+    """Create run_status table if it does not exist."""
+    path = get_run_status_db_path()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS run_status (
+                run_id TEXT NOT NULL,
+                task TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_details TEXT,
+                output_pdbs TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                PRIMARY KEY (run_id, task)
+            )
+        """)
+        conn.commit()
+
+
+def run_status_exists(run_id: str, task: str) -> bool:
+    """Return True if a row exists for (run_id, task)."""
+    path = get_run_status_db_path()
+    with sqlite3.connect(str(path)) as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM run_status WHERE run_id = ? AND task = ?",
+            (run_id, task),
+        )
+        return cur.fetchone() is not None
+
+
+def run_status_insert(run_id: str, task: str, status: str, error_details: Optional[str] = None, output_pdbs: Optional[str] = None) -> None:
+    """Insert a run status row (created_at set to now)."""
+    path = get_run_status_db_path()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            "INSERT INTO run_status (run_id, task, status, error_details, output_pdbs, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, task, status, error_details, output_pdbs, now, now),
+        )
+        conn.commit()
+
+
+def run_status_update(run_id: str, task: str, status: str, error_details: Optional[str] = None, output_pdbs: Optional[str] = None) -> None:
+    """Update status (and optionally error_details, output_pdbs) for (run_id, task)."""
+    path = get_run_status_db_path()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            "UPDATE run_status SET status = ?, error_details = ?, output_pdbs = ?, updated_at = ? WHERE run_id = ? AND task = ?",
+            (status, error_details, output_pdbs, now, run_id, task),
+        )
+        conn.commit()
+
+
+def run_status_get(run_id: str, task: str) -> Optional[dict]:
+    """Return the row for (run_id, task) as dict, or None if not found."""
+    path = get_run_status_db_path()
+    with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT run_id, task, status, error_details, output_pdbs, created_at, updated_at FROM run_status WHERE run_id = ? AND task = ?",
+            (run_id, task),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("output_pdbs"):
+            try:
+                d["output_pdbs"] = json.loads(d["output_pdbs"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return d
 
 
 def run_script(script: Path, args: list[str], timeout: int = STEP_TIMEOUT) -> tuple[int, str, str]:
@@ -57,7 +148,9 @@ def run_script(script: Path, args: list[str], timeout: int = STEP_TIMEOUT) -> tu
 
 
 class RFdiffusionParams(BaseModel):
-    run_name: str = Field(default="pipeline_run", description="Job name; used for outputs")
+    run_id: str = Field(..., description="Unique run ID; must not already exist for RD_DIFFUSION")
+    run_name: str = Field(default="pipeline_run", description="Job name; used for output filenames")
+    pdb_content: Optional[str] = Field(default=None, description="Full PDB file content (text); if set, used instead of pdb ID")
     contigs: str = "12-15/0 R311-337"
     pdb: str = "6B3J"
     iterations: int = 30
@@ -122,13 +215,30 @@ def health():
     }
 
 
+@app.on_event("startup")
+def startup():
+    init_run_status_db()
+
+
 @app.post("/run/rfdiffusion")
 def run_rfdiffusion(params: RFdiffusionParams):
-    """Run step 1: RFdiffusion backbone generation. Output: /workspace/outputs/{run_name}_0.pdb"""
+    """Run step 1: RFdiffusion backbone generation (async). Status stored in DB; poll GET /run/rfdiffusion/status/{run_id}."""
+    if run_status_exists(params.run_id, TASK_RD_DIFFUSION):
+        raise HTTPException(status_code=409, detail=f"run_id '{params.run_id}' already exists for task {TASK_RD_DIFFUSION}")
+    run_status_insert(params.run_id, TASK_RD_DIFFUSION, STATUS_RUNNING)
+
+    pdb_arg = params.pdb
+    if params.pdb_content and params.pdb_content.strip():
+        pdb_path = OUTPUTS / f"{params.run_id}_input.pdb"
+        pdb_path.write_text(params.pdb_content.strip(), encoding="utf-8")
+        pdb_arg = str(pdb_path)
+
     args = [
+        "--run_id", params.run_id,
+        "--run_status_db", str(get_run_status_db_path()),
         "--run_name", params.run_name,
         "--contigs", params.contigs,
-        "--pdb", params.pdb,
+        "--pdb", pdb_arg,
         "--iterations", str(params.iterations),
         "--num_designs", str(params.num_designs),
         "--hotspot", params.hotspot,
@@ -140,10 +250,39 @@ def run_rfdiffusion(params: RFdiffusionParams):
         args.extend(["--symmetry_order", params.symmetry_order])
     if params.chains:
         args.extend(["--chains", params.chains])
-    code, out, err = run_script(SCRIPT_RFDIFFUSION, args)
-    if code != 0:
-        raise HTTPException(status_code=500, detail={"returncode": code, "stdout": out, "stderr": err})
-    return {"status": "ok", "run_name": params.run_name, "stdout": out, "stderr": err}
+
+    if not SCRIPT_RFDIFFUSION.exists():
+        run_status_update(params.run_id, TASK_RD_DIFFUSION, STATUS_ERROR, error_details="Script not found")
+        raise HTTPException(status_code=500, detail=f"Script not found: {SCRIPT_RFDIFFUSION}")
+    subprocess.Popen(
+        ["python3", str(SCRIPT_RFDIFFUSION)] + args,
+        cwd=str(WORKSPACE),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return {"status": "accepted", "run_id": params.run_id}
+
+
+@app.get("/run/rfdiffusion/status/{run_id}")
+def rfdiffusion_status(run_id: str):
+    """Get RFdiffusion run status by run_id. When COMPLETED, includes PDB content of backbones; when ERROR, includes error_details."""
+    row = run_status_get(run_id, TASK_RD_DIFFUSION)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No run found for run_id '{run_id}'")
+    response = dict(row)
+    if response.get("status") == STATUS_COMPLETED and response.get("output_pdbs") and isinstance(response["output_pdbs"], dict):
+        content = {}
+        for key, path in response["output_pdbs"].items():
+            p = Path(path) if isinstance(path, str) else None
+            if p and p.exists():
+                try:
+                    content[key] = p.read_text(encoding="utf-8")
+                except Exception:
+                    content[key] = None
+            else:
+                content[key] = None
+        response["output_pdbs_content"] = content
+    return response
 
 
 @app.post("/run/mpnn")
