@@ -66,7 +66,7 @@ def _ensure_mpnn_tables(conn: sqlite3.Connection) -> None:
             pae REAL,
             rmsd REAL,
             seq TEXT,
-            pdb_path TEXT,
+            pdb_content TEXT,
             created_at TEXT
         )
     """)
@@ -150,15 +150,19 @@ def save_mpnn_results_to_db(
                     pae = _float_or_none(row.get("pae"))
                     rmsd = _float_or_none(row.get("rmsd"))
                     seq = row.get("seq")
-                    pdb_path = None
+                    pdb_content = None
                     if os.path.isdir(all_pdb_dir):
                         candidate = os.path.join(all_pdb_dir, f"design0_n{n}.pdb")
                         if os.path.isfile(candidate):
-                            pdb_path = candidate
+                            try:
+                                with open(candidate, "r", encoding="utf-8") as f:
+                                    pdb_content = f.read()
+                            except Exception:
+                                pass
                     conn.execute(
-                        """INSERT INTO mpnn_run_detail (run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_path, created_at)
+                        """INSERT INTO mpnn_run_detail (run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_content, created_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_path, now),
+                        (run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_content, now),
                     )
         conn.commit()
 

@@ -95,13 +95,18 @@ def init_run_status_db() -> None:
                 pae REAL,
                 rmsd REAL,
                 seq TEXT,
-                pdb_path TEXT,
+                pdb_content TEXT,
                 created_at TEXT,
                 FOREIGN KEY (run_id) REFERENCES mpnn_run_summary(run_id)
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mpnn_run_detail_run_id ON mpnn_run_detail(run_id)")
         conn.commit()
+        try:
+            conn.execute("ALTER TABLE mpnn_run_detail ADD COLUMN pdb_content TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
 
 def run_status_exists(run_id: str, task: str) -> bool:
@@ -215,7 +220,7 @@ def mpnn_detail_get_batch(run_id: str, batch: int, batch_size: int = BATCH_SIZE_
     with sqlite3.connect(str(path)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT id, run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_path, created_at FROM mpnn_run_detail WHERE run_id = ? ORDER BY n LIMIT ? OFFSET ?",
+            "SELECT id, run_id, n, design, mpnn, plddt, ptm, i_ptm, pae, rmsd, seq, pdb_content, created_at FROM mpnn_run_detail WHERE run_id = ? ORDER BY n LIMIT ? OFFSET ?",
             (run_id, batch_size, offset),
         )
         return [dict(row) for row in cur.fetchall()]
