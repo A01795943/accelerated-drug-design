@@ -32,6 +32,7 @@ SCRIPT_ROSETTA = NOTEBOOKS / "3_run_rosetta.py"
 # Run status DB (file-based so child scripts can update it)
 RUN_STATUS_DB = OUTPUTS / "run_status.db"
 TASK_RD_DIFFUSION = "RD_DIFFUSION"
+TASK_MPNN_RF_DIFFUSION = "MPNN+RF_DIFFUSION"
 STATUS_RUNNING = "RUNNING"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_ERROR = "ERROR"
@@ -47,7 +48,7 @@ def get_run_status_db_path() -> Path:
 
 
 def init_run_status_db() -> None:
-    """Create run_status table if it does not exist."""
+    """Create run_status table if it does not exist; add output_csv, output_fasta for MPNN if missing."""
     path = get_run_status_db_path()
     with sqlite3.connect(str(path)) as conn:
         conn.execute("""
@@ -57,12 +58,20 @@ def init_run_status_db() -> None:
                 status TEXT NOT NULL,
                 error_details TEXT,
                 output_pdbs TEXT,
+                output_csv TEXT,
+                output_fasta TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT,
                 PRIMARY KEY (run_id, task)
             )
         """)
         conn.commit()
+        for col in ("output_csv", "output_fasta"):
+            try:
+                conn.execute(f"ALTER TABLE run_status ADD COLUMN {col} TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
 
 def run_status_exists(run_id: str, task: str) -> bool:
@@ -76,26 +85,42 @@ def run_status_exists(run_id: str, task: str) -> bool:
         return cur.fetchone() is not None
 
 
-def run_status_insert(run_id: str, task: str, status: str, error_details: Optional[str] = None, output_pdbs: Optional[str] = None) -> None:
+def run_status_insert(
+    run_id: str,
+    task: str,
+    status: str,
+    error_details: Optional[str] = None,
+    output_pdbs: Optional[str] = None,
+    output_csv: Optional[str] = None,
+    output_fasta: Optional[str] = None,
+) -> None:
     """Insert a run status row (created_at set to now)."""
     path = get_run_status_db_path()
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(str(path)) as conn:
         conn.execute(
-            "INSERT INTO run_status (run_id, task, status, error_details, output_pdbs, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (run_id, task, status, error_details, output_pdbs, now, now),
+            "INSERT INTO run_status (run_id, task, status, error_details, output_pdbs, output_csv, output_fasta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, task, status, error_details, output_pdbs, output_csv, output_fasta, now, now),
         )
         conn.commit()
 
 
-def run_status_update(run_id: str, task: str, status: str, error_details: Optional[str] = None, output_pdbs: Optional[str] = None) -> None:
-    """Update status (and optionally error_details, output_pdbs) for (run_id, task)."""
+def run_status_update(
+    run_id: str,
+    task: str,
+    status: str,
+    error_details: Optional[str] = None,
+    output_pdbs: Optional[str] = None,
+    output_csv: Optional[str] = None,
+    output_fasta: Optional[str] = None,
+) -> None:
+    """Update status (and optionally error_details, output_pdbs, output_csv, output_fasta) for (run_id, task)."""
     path = get_run_status_db_path()
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(str(path)) as conn:
         conn.execute(
-            "UPDATE run_status SET status = ?, error_details = ?, output_pdbs = ?, updated_at = ? WHERE run_id = ? AND task = ?",
-            (status, error_details, output_pdbs, now, run_id, task),
+            "UPDATE run_status SET status = ?, error_details = ?, output_pdbs = ?, output_csv = ?, output_fasta = ?, updated_at = ? WHERE run_id = ? AND task = ?",
+            (status, error_details, output_pdbs, output_csv, output_fasta, now, run_id, task),
         )
         conn.commit()
 
@@ -106,7 +131,7 @@ def run_status_get(run_id: str, task: str) -> Optional[dict]:
     with sqlite3.connect(str(path)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT run_id, task, status, error_details, output_pdbs, created_at, updated_at FROM run_status WHERE run_id = ? AND task = ?",
+            "SELECT run_id, task, status, error_details, output_pdbs, output_csv, output_fasta, created_at, updated_at FROM run_status WHERE run_id = ? AND task = ?",
             (run_id, task),
         )
         row = cur.fetchone()
@@ -163,8 +188,10 @@ class RFdiffusionParams(BaseModel):
 
 
 class MPNNParams(BaseModel):
+    run_id: Optional[str] = Field(default=None, description="If set, run async and store status in DB (task MPNN+RF_DIFFUSION)")
     run_name: str = Field(default="pipeline_run", description="Name for output folder (outputs/{run_name}/)")
-    input_pdb: Optional[str] = Field(default=None, description="Path to input PDB (default: outputs/{run_name}_0.pdb)")
+    pdb_content: Optional[str] = Field(default=None, description="Full PDB file content (text); if set, saved and used as input instead of input_pdb path")
+    input_pdb: Optional[str] = Field(default=None, description="Path to input PDB (default: outputs/{run_name}_0.pdb); ignored if pdb_content is set")
     contigs: str = "20-20/0 R30-127/R138-336/R345-400"
     num_seqs: int = 16
     design_num: int = 0
@@ -293,7 +320,16 @@ def rfdiffusion_status(run_id: str):
 
 @app.post("/run/mpnn")
 def run_mpnn(params: MPNNParams):
-    """Run step 2: ProteinMPNN sequence design. Uses input_pdb if provided, else outputs/{run_name}_0.pdb"""
+    """Run step 2: ProteinMPNN (optional AlphaFold). If run_id is set, runs async and stores status in DB (task MPNN+RF_DIFFUSION). Accepts pdb_content (raw PDB text) or input_pdb path."""
+    input_pdb_arg: Optional[str] = None
+    if params.pdb_content and params.pdb_content.strip():
+        pdb_name = (params.run_id or params.run_name or "mpnn_input").strip()
+        pdb_path = OUTPUTS / f"{pdb_name}_input.pdb"
+        pdb_path.write_text(params.pdb_content.strip(), encoding="utf-8")
+        input_pdb_arg = str(pdb_path)
+    elif params.input_pdb and params.input_pdb.strip():
+        input_pdb_arg = params.input_pdb.strip()
+
     args = [
         "--run_name", params.run_name,
         "--contigs", params.contigs,
@@ -302,8 +338,8 @@ def run_mpnn(params: MPNNParams):
         "--num_designs", str(params.num_designs),
         "--mpnn_sampling_temp", str(params.mpnn_sampling_temp),
     ]
-    if params.input_pdb and params.input_pdb.strip():
-        args.extend(["--input_pdb", params.input_pdb.strip()])
+    if input_pdb_arg:
+        args.extend(["--input_pdb", input_pdb_arg])
     if params.use_alphafold:
         args.append("--use_alphafold")
     if params.initial_guess:
@@ -311,10 +347,36 @@ def run_mpnn(params: MPNNParams):
     if params.use_multimer:
         args.append("--use_multimer")
     args.extend(["--copies", str(params.copies), "--num_recycles", str(params.num_recycles), "--rm_aa", params.rm_aa])
+
+    if params.run_id and params.run_id.strip():
+        run_id = params.run_id.strip()
+        if run_status_exists(run_id, TASK_MPNN_RF_DIFFUSION):
+            raise HTTPException(status_code=409, detail=f"run_id '{run_id}' already exists for task {TASK_MPNN_RF_DIFFUSION}")
+        run_status_insert(run_id, TASK_MPNN_RF_DIFFUSION, STATUS_RUNNING)
+        args = ["--run_id", run_id, "--run_status_db", str(get_run_status_db_path())] + args
+        if not SCRIPT_MPNN.exists():
+            run_status_update(run_id, TASK_MPNN_RF_DIFFUSION, STATUS_ERROR, error_details="Script not found")
+            raise HTTPException(status_code=500, detail=f"Script not found: {SCRIPT_MPNN}")
+        subprocess.Popen(
+            ["python3", str(SCRIPT_MPNN)] + args,
+            cwd=str(WORKSPACE),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        return {"status": "accepted", "run_id": run_id}
     code, out, err = run_script(SCRIPT_MPNN, args)
     if code != 0:
         raise HTTPException(status_code=500, detail={"returncode": code, "stdout": out, "stderr": err})
     return {"status": "ok", "run_name": params.run_name, "stdout": out, "stderr": err}
+
+
+@app.get("/run/mpnn/status/{run_id}")
+def mpnn_status(run_id: str):
+    """Get MPNN+RF_DIFFUSION run status by run_id. When COMPLETED, includes output_csv and output_fasta (CSV and FASTA content); when ERROR, includes error_details."""
+    row = run_status_get(run_id, TASK_MPNN_RF_DIFFUSION)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No run found for run_id '{run_id}'")
+    return row
 
 
 @app.post("/run/rosetta")

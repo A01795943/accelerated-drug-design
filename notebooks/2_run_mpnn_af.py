@@ -2,17 +2,41 @@
 Step 2: ProteinMPNN sequence design (optional AlphaFold validation).
 Reads: /workspace/outputs/{run_name}_0.pdb
 Writes: /workspace/outputs/{run_name}/ (mpnn_results.csv, design.fasta, and optionally best.pdb etc.)
+When run_id and run_status_db are provided, updates run_status table (task MPNN+RF_DIFFUSION) on completion.
 """
 import os
 import sys
 import subprocess
 import argparse
+import sqlite3
 import time
+from datetime import datetime, timezone
 
 sys.path.append("/workspace/RFdiffusion")
 sys.path.append("/workspace/colabdesign")
 
 OUTPUTS_DIR = "/workspace/outputs"
+TASK_MPNN_RF_DIFFUSION = "MPNN+RF_DIFFUSION"
+STATUS_COMPLETED = "COMPLETED"
+STATUS_ERROR = "ERROR"
+
+
+def update_run_status_mpnn(
+    run_status_db: str,
+    run_id: str,
+    status: str,
+    error_details: str | None = None,
+    output_csv: str | None = None,
+    output_fasta: str | None = None,
+) -> None:
+    """Update run_status table for task MPNN+RF_DIFFUSION: status, error_details, output_csv, output_fasta, updated_at."""
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(run_status_db) as conn:
+        conn.execute(
+            "UPDATE run_status SET status = ?, error_details = ?, output_csv = ?, output_fasta = ?, updated_at = ? WHERE run_id = ? AND task = ?",
+            (status, error_details, output_csv, output_fasta, now, run_id, TASK_MPNN_RF_DIFFUSION),
+        )
+        conn.commit()
 
 
 def run_proteinmpnn_alphafold(
@@ -279,6 +303,8 @@ print(f"MPNN only completed. Results saved to {output_dir}")
 
 def main():
     parser = argparse.ArgumentParser(description="Step 2: ProteinMPNN sequence design")
+    parser.add_argument("--run_id", type=str, default=None, help="If set, update run_status DB on completion (task MPNN+RF_DIFFUSION)")
+    parser.add_argument("--run_status_db", type=str, default="/workspace/outputs/run_status.db", help="Path to run_status SQLite DB")
     parser.add_argument("--run_name", type=str, default="pipeline_run", help="Name for output folder (outputs/{run_name}/)")
     parser.add_argument("--input_pdb", type=str, default="/workspace/outputs/test_200226_1_0.pdb", help="Path to input PDB file (default: outputs/{run_name}_{design_num}.pdb)")
     parser.add_argument("--contigs", type=str, default="20-35/0 A19-127")
@@ -296,39 +322,67 @@ def main():
 
     start = time.time()
     pdb_file = args.input_pdb.strip() if (args.input_pdb and args.input_pdb.strip()) else None
-    if args.use_alphafold:
-        success = run_proteinmpnn_alphafold(
-            run_name=args.run_name,
-            contigs=args.contigs,
-            pdb_file=pdb_file,
-            copies=args.copies,
-            num_seqs=args.num_seqs,
-            initial_guess=args.initial_guess,
-            num_recycles=args.num_recycles,
-            use_multimer=args.use_multimer,
-            rm_aa=args.rm_aa,
-            mpnn_sampling_temp=args.mpnn_sampling_temp,
-            num_designs=args.num_designs,
-            design_num=args.design_num,
-        )
-    else:
-        success = run_proteinmpnn_only(
-            run_name=args.run_name,
-            contigs=args.contigs,
-            pdb_file=pdb_file,
-            copies=args.copies,
-            num_seqs=args.num_seqs,
-            initial_guess=args.initial_guess,
-            num_recycles=args.num_recycles,
-            use_multimer=args.use_multimer,
-            rm_aa=args.rm_aa,
-            mpnn_sampling_temp=args.mpnn_sampling_temp,
-            num_designs=args.num_designs,
-            design_num=args.design_num,
-        )
+    success = False
+    try:
+        if args.use_alphafold:
+            success = run_proteinmpnn_alphafold(
+                run_name=args.run_name,
+                contigs=args.contigs,
+                pdb_file=pdb_file,
+                copies=args.copies,
+                num_seqs=args.num_seqs,
+                initial_guess=args.initial_guess,
+                num_recycles=args.num_recycles,
+                use_multimer=args.use_multimer,
+                rm_aa=args.rm_aa,
+                mpnn_sampling_temp=args.mpnn_sampling_temp,
+                num_designs=args.num_designs,
+                design_num=args.design_num,
+            )
+        else:
+            success = run_proteinmpnn_only(
+                run_name=args.run_name,
+                contigs=args.contigs,
+                pdb_file=pdb_file,
+                copies=args.copies,
+                num_seqs=args.num_seqs,
+                initial_guess=args.initial_guess,
+                num_recycles=args.num_recycles,
+                use_multimer=args.use_multimer,
+                rm_aa=args.rm_aa,
+                mpnn_sampling_temp=args.mpnn_sampling_temp,
+                num_designs=args.num_designs,
+                design_num=args.design_num,
+            )
+    except Exception as e:
+        if args.run_id and args.run_status_db and os.path.isfile(args.run_status_db):
+            update_run_status_mpnn(args.run_status_db, args.run_id, STATUS_ERROR, error_details=str(e))
+        raise
     print("=" * 60)
     print(f"TIEMPO TOTAL: {time.time() - start:.2f} segundos")
     print("=" * 60)
+    if args.run_id and args.run_status_db and os.path.isfile(args.run_status_db):
+        if success:
+            output_dir = os.path.join(OUTPUTS_DIR, args.run_name)
+            output_csv = None
+            csv_path = os.path.join(output_dir, "mpnn_results.csv")
+            if os.path.isfile(csv_path):
+                try:
+                    with open(csv_path, "r", encoding="utf-8") as f:
+                        output_csv = f.read()
+                except Exception:
+                    pass
+            output_fasta = None
+            fasta_path = os.path.join(output_dir, "design.fasta")
+            if os.path.isfile(fasta_path):
+                try:
+                    with open(fasta_path, "r", encoding="utf-8") as f:
+                        output_fasta = f.read()
+                except Exception:
+                    pass
+            update_run_status_mpnn(args.run_status_db, args.run_id, STATUS_COMPLETED, output_csv=output_csv, output_fasta=output_fasta)
+        else:
+            update_run_status_mpnn(args.run_status_db, args.run_id, STATUS_ERROR, error_details="MPNN step exited with non-zero return code")
     sys.exit(0 if success else 1)
 
 
