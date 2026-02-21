@@ -215,6 +215,12 @@ def health():
     }
 
 
+@app.get("/hello")
+def hello():
+    """Simple GET endpoint to test network config. Returns hello world."""
+    return {"message": "hello world"}
+
+
 @app.on_event("startup")
 def startup():
     init_run_status_db()
