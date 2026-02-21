@@ -8,3 +8,4 @@ __pycache__/
 
 # Rosseta 
 /notebooks/PyRosetta4.Release.python310.linux.release-387.tar.bz2
+/outputs
