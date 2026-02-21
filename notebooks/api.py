@@ -451,11 +451,8 @@ def run_mpnn(params: MPNNParams):
 
 
 @app.get("/run/mpnn/status/{run_id}")
-def mpnn_status(
-    run_id: str,
-    batch: int = Query(0, ge=0, description="Detail batch index (0-based). Only used when status is COMPLETED."),
-):
-    """Get MPNN+RF_DIFFUSION run status by run_id. When COMPLETED, returns summary (params, fasta, best PDB), pagination info (total_records, total_batches, batch_size), and one batch of detail records. Use ?batch=N to fetch the N-th batch of 50 detail rows. When RUNNING or ERROR, returns status row only."""
+def mpnn_status(run_id: str):
+    """Get MPNN+RF_DIFFUSION run status by run_id. When COMPLETED, returns summary (params, fasta, best PDB) and pagination info (total_records, total_batches, batch_size). Use GET /run/mpnn/status/{run_id}/detail?batch=N to fetch detail batches. When RUNNING or ERROR, returns status row only."""
     row = run_status_get(run_id, TASK_MPNN_RF_DIFFUSION)
     if row is None:
         raise HTTPException(status_code=404, detail=f"No run found for run_id '{run_id}'")
@@ -464,11 +461,34 @@ def mpnn_status(
     summary = mpnn_summary_get(run_id)
     total_records = mpnn_detail_count(run_id)
     total_batches = (total_records + BATCH_SIZE_MPNN - 1) // BATCH_SIZE_MPNN if total_records else 0
-    batch_number = min(batch, max(0, total_batches - 1)) if total_batches else 0
-    detail = mpnn_detail_get_batch(run_id, batch_number, BATCH_SIZE_MPNN) if total_records else []
     return {
         **row,
         "summary": summary or {},
+        "pagination": {
+            "total_records": total_records,
+            "total_batches": total_batches,
+            "batch_size": BATCH_SIZE_MPNN,
+        },
+    }
+
+
+@app.get("/run/mpnn/status/{run_id}/detail")
+def mpnn_status_detail(
+    run_id: str,
+    batch: int = Query(0, ge=0, description="Batch index (0-based). Returns up to 50 detail rows per batch."),
+):
+    """Fetch one batch of detail records (sequences, metrics, PDB content) for a completed MPNN run. Returns 404 if run not found or not COMPLETED."""
+    row = run_status_get(run_id, TASK_MPNN_RF_DIFFUSION)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No run found for run_id '{run_id}'")
+    if row.get("status") != STATUS_COMPLETED:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' is not completed (status: {row.get('status')})")
+    total_records = mpnn_detail_count(run_id)
+    total_batches = (total_records + BATCH_SIZE_MPNN - 1) // BATCH_SIZE_MPNN if total_records else 0
+    batch_number = min(batch, max(0, total_batches - 1)) if total_batches else 0
+    detail = mpnn_detail_get_batch(run_id, batch_number, BATCH_SIZE_MPNN) if total_records else []
+    return {
+        "run_id": run_id,
         "pagination": {
             "total_records": total_records,
             "total_batches": total_batches,
