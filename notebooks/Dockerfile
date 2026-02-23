@@ -75,10 +75,11 @@ RUN mkdir -p params && \
     rm alphafold_params_2022-12-06.tar && \
     touch params/done.txt
 
-##################################    
-# PYROSETTA - VERSIÓN DEFINITIVA:
-# PYROSETTA - SOLO PARA EXPLORAR:
-COPY PyRosetta4.Release.python310.linux.release-387.tar.bz2 /workspace/
+##################################
+# PYROSETTA - INSTALL DURING BUILD
+# (Previously this tarball had to be downloaded manually into notebooks/)
+RUN wget -q -O /workspace/PyRosetta4.Release.python310.linux.release-387.tar.bz2 \
+  https://graylab.jhu.edu/download/PyRosetta4/archive/release/PyRosetta4.Release.python310.linux/PyRosetta4.Release.python310.linux.release-387.tar.bz2
 RUN cd /workspace && tar -xf PyRosetta4.Release.python310.linux.release-387.tar.bz2
 RUN cd /workspace/PyRosetta4.Release.python310.linux.release-387/setup && python3 setup.py install
 ##################################
