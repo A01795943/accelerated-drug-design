@@ -11,3 +11,4 @@ data/resultados
 rutas.env
 /notebooks/PyRosetta4.Release.python310.linux.release-387.tar.bz2
 /outputs
+/notebooks/MonitorRecursosCallback.py
