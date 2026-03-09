@@ -20,8 +20,8 @@ def main():
     ruta_archivo_env = os.path.join(os.getcwd(), "..", "rutas.env")
     load_dotenv(dotenv_path=ruta_archivo_env, override=True)
     
-    ruta_dataset = os.getenv('ruta_dataset2')
-    ruta_resultados = os.getenv('ruta_resultados')
+    ruta_dataset = os.getenv('ruta_dataset2')  # Estas rutas cambialas y modificalas acorde a tu rutas y nombres
+    ruta_resultados = os.getenv('ruta_resultados') # Estas rutas cambialas y modificalas acorde a tu rutas y nombres
 
     if not ruta_dataset or not ruta_resultados:
         raise ValueError("❌ ERROR: Faltan variables en el archivo rutas.env")
@@ -147,7 +147,7 @@ def main():
     print(f"📉 Error Absoluto Medio (MAE): {mae:.4f}")
     print(f"📈 Correlación de Spearman:    {spearman_corr:.4f}")
     print("="*50)
-    print("✅ PIPELINE FINALIZADO CON ÉXITO. ¡Buenas noches!")
+    print("✅ PIPELINE FINALIZADO CON ÉXITO.")
 
 if __name__ == "__main__":
     main()
