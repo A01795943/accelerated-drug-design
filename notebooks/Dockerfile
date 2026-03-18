@@ -28,7 +28,8 @@ RUN pip3 install \
     pillow \
     matplotlib \
     py3Dmol \
-    ipywidgets 
+    ipywidgets \
+    fair-esm
 
 WORKDIR /workspace
 
