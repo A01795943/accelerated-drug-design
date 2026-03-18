@@ -23,6 +23,7 @@ RUN pip3 install \
     tqdm \
     numpy \
     scipy \
+    scikit-learn \
     networkx \
     requests \
     pillow \
