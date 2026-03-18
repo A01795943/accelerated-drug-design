@@ -24,6 +24,7 @@ RUN pip3 install \
     numpy \
     scipy \
     scikit-learn \
+    xgboost \
     networkx \
     requests \
     pillow \
