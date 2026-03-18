@@ -8,7 +8,7 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.neural_network import MLPRegressor
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, r2_score
 from scipy.stats import spearmanr
 
 def main():
@@ -140,12 +140,14 @@ def main():
     predicciones = mlp_model.predict(X_test_scaled)
     mae = mean_absolute_error(y_test, predicciones)
     spearman_corr, _ = spearmanr(y_test, predicciones)
+    r2 = r2_score(y_test, predicciones)
 
     print("\n" + "="*50)
     print("🏆 RESULTADOS FINALES DEL PREDICTOR (i_PTM)")
     print("="*50)
     print(f"📉 Error Absoluto Medio (MAE): {mae:.4f}")
     print(f"📈 Correlación de Spearman:    {spearman_corr:.4f}")
+    print(f"   Evaluación de R2:      {r2}")
     print("="*50)
     print("✅ PIPELINE FINALIZADO CON ÉXITO.")
 
