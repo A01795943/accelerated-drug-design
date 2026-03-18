@@ -2,14 +2,18 @@
 REST API for the drug design pipeline.
 Run with: uvicorn api:app --host 0.0.0.0 --port 8000
 """
+import ast
 import json
 import os
 import sqlite3
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import importlib.util
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -28,11 +32,13 @@ OUTPUTS = WORKSPACE / "outputs"
 SCRIPT_RFDIFFUSION = NOTEBOOKS / "1_run_rfdiffusion.py"
 SCRIPT_MPNN = NOTEBOOKS / "2_run_mpnn_af.py"
 SCRIPT_ROSETTA = NOTEBOOKS / "3_run_rosetta.py"
+SCRIPT_INFERENCE_MODEL = NOTEBOOKS / "4_run_inference.py"
 
 # Run status DB (file-based so child scripts can update it)
 RUN_STATUS_DB = OUTPUTS / "run_status.db"
 TASK_RD_DIFFUSION = "RD_DIFFUSION"
 TASK_MPNN_RF_DIFFUSION = "MPNN+RF_DIFFUSION"
+TASK_INFERENCE = "INFERENCE"
 STATUS_RUNNING = "RUNNING"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_ERROR = "ERROR"
@@ -48,7 +54,7 @@ def get_run_status_db_path() -> Path:
 
 
 def init_run_status_db() -> None:
-    """Create run_status table if it does not exist; add output_csv, output_fasta for MPNN if missing."""
+    """Create run_status table if it does not exist; add related tables if missing."""
     path = get_run_status_db_path()
     with sqlite3.connect(str(path)) as conn:
         conn.execute("""
@@ -107,6 +113,45 @@ def init_run_status_db() -> None:
             conn.commit()
         except sqlite3.OperationalError:
             pass
+        # Inference jobs and records
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inference_jobs (
+                run_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error_details TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inference_jobs_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                seq TEXT,
+                mpnn REAL,
+                plddt REAL,
+                ptm REAL,
+                i_ptm REAL,
+                predicted_ptm REAL,
+                predicted_i_ptm REAL,
+                pae REAL,
+                i_pae REAL,
+                rmsd REAL,
+                status TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                FOREIGN KEY (run_id) REFERENCES inference_jobs(run_id)
+            )
+        """)
+        # Backward-compatible: add predicted_ptm / predicted_i_ptm if table already existed
+        for col in ("predicted_ptm", "predicted_i_ptm"):
+            try:
+                conn.execute(f"ALTER TABLE inference_jobs_records ADD COLUMN {col} REAL")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inference_records_run_id ON inference_jobs_records(run_id)")
 
 
 def run_status_exists(run_id: str, task: str) -> bool:
@@ -226,6 +271,111 @@ def mpnn_detail_get_batch(run_id: str, batch: int, batch_size: int = BATCH_SIZE_
         return [dict(row) for row in cur.fetchall()]
 
 
+def inference_insert_job(run_id: str, status: str, error_details: Optional[str] = None) -> None:
+    """Insert or update a row in inference_jobs."""
+    path = get_run_status_db_path()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO inference_jobs (run_id, status, error_details, created_at, completed_at)
+            VALUES (?, ?, ?, ?, NULL)
+            ON CONFLICT(run_id) DO UPDATE SET status = excluded.status, error_details = excluded.error_details
+            """,
+            (run_id, status, error_details, now),
+        )
+        conn.commit()
+
+
+def inference_update_job_completed(run_id: str, status: str, error_details: Optional[str] = None) -> None:
+    """Mark inference job as completed or error."""
+    path = get_run_status_db_path()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            "UPDATE inference_jobs SET status = ?, error_details = ?, completed_at = ? WHERE run_id = ?",
+            (status, error_details, now, run_id),
+        )
+        conn.commit()
+
+
+def inference_insert_record(
+    run_id: str,
+    n: int,
+    seq: Optional[str],
+    mpnn: Optional[float],
+    plddt: Optional[float],
+    ptm: Optional[float],
+    i_ptm: Optional[float],
+    pae: Optional[float],
+    rmsd: Optional[float],
+) -> None:
+    """Insert one record row for inference job."""
+    path = get_run_status_db_path()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO inference_jobs_records
+                (run_id, n, seq, mpnn, plddt, ptm, i_ptm, predicted_ptm, predicted_i_ptm, pae, rmsd, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                n,
+                seq,
+                mpnn,
+                plddt,
+                ptm,
+                i_ptm,
+                None,  # predicted_ptm
+                None,  # predicted_i_ptm
+                pae,
+                rmsd,
+                "PENDING",
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def inference_update_record_metrics(
+    record_id: int,
+    predicted_ptm: Optional[float],
+    predicted_i_ptm: Optional[float],
+    status: str,
+) -> None:
+    """Update predicted_ptm/predicted_i_ptm and status for one inference record."""
+    path = get_run_status_db_path()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            "UPDATE inference_jobs_records SET predicted_ptm = ?, predicted_i_ptm = ?, status = ?, updated_at = ? WHERE id = ?",
+            (predicted_ptm, predicted_i_ptm, status, now, record_id),
+        )
+        conn.commit()
+
+
+def inference_update_record_af_metrics(
+    record_id: int,
+    plddt: Optional[float],
+    ptm: Optional[float],
+    i_ptm: Optional[float],
+    pae: Optional[float],
+    rmsd: Optional[float],
+) -> None:
+    """Update AF metrics for one inference record."""
+    path = get_run_status_db_path()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            "UPDATE inference_jobs_records SET plddt = ?, ptm = ?, i_ptm = ?, pae = ?, rmsd = ?, updated_at = ? WHERE id = ?",
+            (plddt, ptm, i_ptm, pae, rmsd, now, record_id),
+        )
+        conn.commit()
+
+
 def run_script(script: Path, args: list[str], timeout: int = STEP_TIMEOUT) -> tuple[int, str, str]:
     """Run a Python script from /workspace; return (returncode, stdout, stderr)."""
     if not script.exists():
@@ -284,6 +434,23 @@ class MPNNParams(BaseModel):
     mpnn_sampling_temp: float = 0.1
     num_designs: int = 1
 
+
+class InferenceParams(BaseModel):
+    run_id: Optional[str] = Field(default=None, description="If set, run async and store status in DB (task MPNN+RF_DIFFUSION)")
+    run_name: str = Field(default="pipeline_run", description="Name for output folder (outputs/{run_name}/)")
+    pdb_content: Optional[str] = Field(default=None, description="Full PDB file content (text); if set, saved and used as input instead of input_pdb path")
+    input_pdb: Optional[str] = Field(default=None, description="Path to input PDB (default: outputs/{run_name}_0.pdb); ignored if pdb_content is set")
+    contigs: str = "20-20/0 R30-127/R138-336/R345-400"
+    num_seqs: int = 16
+    design_num: int = 0
+    use_alphafold: bool = False
+    copies: int = 1
+    initial_guess: bool = False
+    num_recycles: int = 1
+    use_multimer: bool = True
+    rm_aa: str = "C"
+    mpnn_sampling_temp: float = 0.1
+    num_designs: int = 1
 
 class RosettaParams(BaseModel):
     run_name: str = Field(default="pipeline_run", description="Must match step 1 and 2 run_name")
@@ -450,6 +617,244 @@ def run_mpnn(params: MPNNParams):
     return {"status": "ok", "run_name": params.run_name, "stdout": out, "stderr": err}
 
 
+def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
+    """
+    Background worker for /run/inference.
+    1) Ejecuta 2_run_mpnn_af.py sin AlphaFold (num_seqs * 10) y copia resultados a inference_jobs_records.
+    2) Para cada secuencia, llama a 4_run_inference.py para obtener ptm e iptm, decide VIABLE / NO_VIABLE.
+    3) Marca el job como COMPLETED o ERROR.
+    """
+    try:
+        print(f"[INFERENCE] Starting inference pipeline for run_id={run_id}")
+        params = InferenceParams(**params_dict)
+
+        # Preparar input PDB si viene en el request
+        input_pdb_arg: Optional[str] = None
+        if params.pdb_content and params.pdb_content.strip():
+            pdb_name = (run_id or params.run_name or "inference_input").strip()
+            pdb_path = OUTPUTS / f"{pdb_name}_input.pdb"
+            pdb_path.write_text(params.pdb_content.strip(), encoding="utf-8")
+            input_pdb_arg = str(pdb_path)
+        elif params.input_pdb and params.input_pdb.strip():
+            input_pdb_arg = params.input_pdb.strip()
+
+        # 1) Ejecutar MPNN (solo ProteinMPNN, sin AlphaFold)
+        mpnn_run_id = f"{run_id}_MPNN"
+
+        # Registrar run de MPNN en run_status para que 2_run_mpnn_af pueda actualizarlo
+        if not run_status_exists(mpnn_run_id, TASK_MPNN_RF_DIFFUSION):
+            run_status_insert(mpnn_run_id, TASK_MPNN_RF_DIFFUSION, STATUS_RUNNING)
+
+        mpnn_args = [
+            "--run_name", params.run_name,
+            "--contigs", params.contigs,
+            "--num_seqs", str(params.num_seqs),
+            "--design_num", str(params.design_num),
+            "--num_designs", str(params.num_designs),
+            "--mpnn_sampling_temp", str(params.mpnn_sampling_temp),
+        ]
+        if input_pdb_arg:
+            mpnn_args.extend(["--input_pdb", input_pdb_arg])
+        # Forzar sin AlphaFold: no agregar --use_alphafold
+        if params.initial_guess:
+            mpnn_args.append("--initial_guess")
+        if params.use_multimer:
+            mpnn_args.append("--use_multimer")
+        mpnn_args.extend([
+            "--copies", str(params.copies),
+            "--num_recycles", str(params.num_recycles),
+            "--rm_aa", params.rm_aa,
+        ])
+
+        mpnn_args = ["--run_id", mpnn_run_id, "--run_status_db", str(get_run_status_db_path())] + mpnn_args
+
+        print(f"[INFERENCE] Running MPNN-only step for run_id={run_id} (effective_num_seqs={effective_num_seqs})")
+        code, out, err = run_script(SCRIPT_MPNN, mpnn_args)
+        if code != 0:
+            # Error en MPNN
+            msg = f"MPNN step failed: returncode={code}, stderr={err}"
+            print(f"[INFERENCE] ERROR in MPNN-only step for run_id={run_id}: {msg}")
+            run_status_update(run_id, TASK_INFERENCE, STATUS_ERROR, error_details=msg)
+            inference_update_job_completed(run_id, STATUS_ERROR, msg)
+            return
+
+        # 1.b) Copiar resultados desde mpnn_run_detail a inference_jobs_records
+        # En este modo (sin AlphaFold) solo confiamos en seq y mpnn; el resto de métricas se deja en NULL.
+        total_records = mpnn_detail_count(mpnn_run_id)
+        print(f"[INFERENCE] MPNN-only produced {total_records} records for mpnn_run_id={mpnn_run_id}")
+        if total_records > 0:
+            total_batches = (total_records + BATCH_SIZE_MPNN - 1) // BATCH_SIZE_MPNN
+            for batch in range(total_batches):
+                rows = mpnn_detail_get_batch(mpnn_run_id, batch, BATCH_SIZE_MPNN)
+                for row in rows:
+                    n = row.get("n")
+                    if n is None:
+                        continue
+                    seq = row.get("seq")
+                    mpnn_val = row.get("mpnn")
+                    inference_insert_record(
+                        run_id,
+                        int(n),
+                        seq,
+                        mpnn_val,
+                        None,  # plddt
+                        None,  # ptm
+                        None,  # i_ptm
+                        None,  # pae
+                        None,  # rmsd
+                    )
+
+        print(f"[INFERENCE] Saved initial inference records for run_id={run_id}, starting surrogate inference (4_run_inference.py)")
+
+        # 2) Para cada registro, llamar a 4_run_inference.py para obtener ptm / iptm (predicciones del modelo surrogate)
+        path = get_run_status_db_path()
+        with sqlite3.connect(str(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT id, seq, mpnn FROM inference_jobs_records WHERE run_id = ? ORDER BY n",
+                (run_id,),
+            )
+            rows = cur.fetchall()
+
+        for rec in rows:
+            rec_id = rec["id"]
+            seq = rec["seq"]
+            mpnn_val = rec["mpnn"]
+            if not seq:
+                print(f"[INFERENCE] Skipping record id={rec_id} for run_id={run_id}: empty sequence")
+                inference_update_record_metrics(rec_id, None, None, "NO_VIABLE")
+                continue
+            energy_score = float(mpnn_val) if mpnn_val is not None else 0.0
+
+            # Ejecutar modelo de inferencia vía script 4_run_inference.py
+            code_inf, out_inf, err_inf = run_script(
+                SCRIPT_INFERENCE_MODEL,
+                [seq, str(energy_score)],
+            )
+            ptm_inf: Optional[float] = None
+            i_ptm_inf: Optional[float] = None
+            if code_inf == 0 and out_inf.strip():
+                try:
+                    data = ast.literal_eval(out_inf.strip())
+                    ptm_inf = float(data.get("ptm")) if data.get("ptm") is not None else None
+                    i_ptm_inf = float(data.get("iptm")) if data.get("iptm") is not None else None
+                except Exception:
+                    print(f"[INFERENCE] WARNING: could not parse inference output for record id={rec_id}, run_id={run_id}: {out_inf!r}")
+                    ptm_inf = None
+                    i_ptm_inf = None
+            else:
+                print(f"[INFERENCE] Surrogate inference failed for record id={rec_id}, run_id={run_id}: returncode={code_inf}, stderr={err_inf}")
+
+            # Decidir viabilidad usando predicted_ptm / predicted_i_ptm
+            if ptm_inf is not None and i_ptm_inf is not None and ptm_inf >= 0.6 and i_ptm_inf >= 0.6:
+                status = "VIABLE"
+            else:
+                status = "NO_VIABLE"
+            inference_update_record_metrics(rec_id, ptm_inf, i_ptm_inf, status)
+
+        print(f"[INFERENCE] Finished surrogate inference for run_id={run_id}, starting AlphaFold-only for VIABLE sequences")
+
+        # 3) Para cada secuencia VIABLE, ejecutar AlphaFold-only para obtener métricas estructurales reales
+        #    y guardarlas en las columnas plddt, ptm, i_ptm, pae, rmsd.
+        try:
+            mpnn_af_path = NOTEBOOKS / "2_run_mpnn_af.py"
+            spec = importlib.util.spec_from_file_location("mpnn_af_module", str(mpnn_af_path))
+            mpnn_af_module = None
+            if spec and spec.loader:
+                mpnn_af_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mpnn_af_module)  # type: ignore[assignment]
+        except Exception as e:
+            print(f"[INFERENCE] ⚠️ No se pudo cargar 2_run_mpnn_af.py para AlphaFold-only: {e}")
+            mpnn_af_module = None
+
+        if mpnn_af_module and hasattr(mpnn_af_module, "run_alphafold_only"):
+            with sqlite3.connect(str(path)) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT id, seq, mpnn FROM inference_jobs_records WHERE run_id = ? AND status = 'VIABLE' ORDER BY n",
+                    (run_id,),
+                )
+                viable_rows = cur.fetchall()
+
+            print(f"[INFERENCE] Found {len(viable_rows)} VIABLE records for AlphaFold-only, run_id={run_id}")
+
+            for rec in viable_rows:
+                rec_id = rec["id"]
+                seq = rec["seq"]
+                mpnn_val = rec["mpnn"]
+                if not seq:
+                    continue
+                energy_score = float(mpnn_val) if mpnn_val is not None else 0.0
+
+                try:
+                    metrics = mpnn_af_module.run_alphafold_only(  # type: ignore[attr-defined]
+                        run_name=params.run_name,
+                        seq=seq,
+                        mpnn_score=energy_score,
+                        contigs=params.contigs,
+                        pdb_file=input_pdb_arg,
+                        copies=params.copies,
+                        initial_guess=params.initial_guess,
+                        num_recycles=params.num_recycles,
+                        use_multimer=params.use_multimer,
+                        rm_aa=params.rm_aa,
+                    )
+                    inference_update_record_af_metrics(
+                        rec_id,
+                        metrics.get("plddt"),
+                        metrics.get("ptm"),
+                        metrics.get("i_ptm"),
+                        metrics.get("pae"),
+                        metrics.get("rmsd"),
+                    )
+                except Exception as e:
+                    print(f"[INFERENCE] ⚠️ Error ejecutando run_alphafold_only para registro {rec_id}, run_id={run_id}: {e}")
+        else:
+            print(f"[INFERENCE] ⚠️ AlphaFold-only step skipped: run_alphafold_only not available")
+
+        # 4) Marcar job como completado
+        run_status_update(run_id, TASK_INFERENCE, STATUS_COMPLETED, error_details=None)
+        inference_update_job_completed(run_id, STATUS_COMPLETED, None)
+    except Exception as e:
+        msg = f"Inference pipeline error: {e}"
+        try:
+            run_status_update(run_id, TASK_INFERENCE, STATUS_ERROR, error_details=msg)
+            inference_update_job_completed(run_id, STATUS_ERROR, msg)
+        except Exception:
+            # Best-effort; avoid crashing the worker
+            pass
+        print(f"[INFERENCE] FATAL ERROR in inference pipeline for run_id={run_id}: {e}")
+
+
+@app.post("/run/inference")
+def run_inference(params: InferenceParams):
+    """
+    Orchestrate inference pipeline asynchronously.
+    - Registers job in run_status (task INFERENCE) and inference_jobs.
+    - Returns immediately with 200.
+    - Background worker runs MPNN (no AlphaFold), 4_run_inference per sequence,
+      updates inference_jobs_records and marks job as completed.
+    """
+    # Decide run_id
+    run_id = (params.run_id or f"inference_{uuid.uuid4().hex[:8]}").strip()
+    if run_status_exists(run_id, TASK_INFERENCE):
+        raise HTTPException(status_code=409, detail=f"run_id '{run_id}' already exists for task {TASK_INFERENCE}")
+
+    # Register job
+    run_status_insert(run_id, TASK_INFERENCE, STATUS_RUNNING)
+    inference_insert_job(run_id, STATUS_RUNNING, None)
+
+    # Launch background worker
+    worker_params = params.dict()
+    threading.Thread(
+        target=_run_inference_pipeline_worker,
+        args=(run_id, worker_params),
+        daemon=True,
+    ).start()
+
+    return {"status": "accepted", "run_id": run_id}
+
+
 @app.get("/run/mpnn/status/{run_id}")
 def mpnn_status(run_id: str):
     """Get MPNN+RF_DIFFUSION run status by run_id. When COMPLETED, returns summary (params, fasta, best PDB) and pagination info (total_records, total_batches, batch_size). Use GET /run/mpnn/status/{run_id}/detail?batch=N to fetch detail batches. When RUNNING or ERROR, returns status row only."""
@@ -469,6 +874,71 @@ def mpnn_status(run_id: str):
             "total_batches": total_batches,
             "batch_size": BATCH_SIZE_MPNN,
         },
+    }
+
+
+@app.get("/run/inference/status/{run_id}")
+def inference_status(run_id: str):
+    """Get inference job status by run_id."""
+    row = run_status_get(run_id, TASK_INFERENCE)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No inference run found for run_id '{run_id}'")
+    path = get_run_status_db_path()
+    with sqlite3.connect(str(path)) as conn:
+        cur = conn.execute(
+            "SELECT status, error_details, created_at, completed_at FROM inference_jobs WHERE run_id = ?",
+            (run_id,),
+        )
+        job = cur.fetchone()
+        cur2 = conn.execute("SELECT COUNT(*) FROM inference_jobs_records WHERE run_id = ?", (run_id,))
+        total_records = cur2.fetchone()[0]
+    job_info = dict(job) if job else {}
+    return {
+        **row,
+        "job": job_info,
+        "total_records": total_records,
+    }
+
+
+@app.get("/run/inference/status/{run_id}/detail")
+def inference_status_detail(
+    run_id: str,
+    batch: int = Query(0, ge=0, description="Batch index (0-based). Returns up to 50 detail rows per batch."),
+    batch_size: int = Query(50, ge=1, le=500),
+):
+    """Fetch paginated detail records for an inference job."""
+    row = run_status_get(run_id, TASK_INFERENCE)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No inference run found for run_id '{run_id}'")
+
+    path = get_run_status_db_path()
+    offset = batch * batch_size
+    with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT id, run_id, n, seq, mpnn, plddt, ptm, i_ptm, pae, i_pae, rmsd, status, created_at, updated_at
+            FROM inference_jobs_records
+            WHERE run_id = ?
+            ORDER BY n
+            LIMIT ? OFFSET ?
+            """,
+            (run_id, batch_size, offset),
+        )
+        records = [dict(r) for r in cur.fetchall()]
+        cur2 = conn.execute("SELECT COUNT(*) FROM inference_jobs_records WHERE run_id = ?", (run_id,))
+        total_records = cur2.fetchone()[0]
+
+    total_batches = (total_records + batch_size - 1) // batch_size if total_records else 0
+    return {
+        "run_id": run_id,
+        "pagination": {
+            "total_records": total_records,
+            "total_batches": total_batches,
+            "batch_size": batch_size,
+        },
+        "batch_number": batch,
+        "detail": records,
     }
 
 
