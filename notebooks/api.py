@@ -668,7 +668,7 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
 
         mpnn_args = ["--run_id", mpnn_run_id, "--run_status_db", str(get_run_status_db_path())] + mpnn_args
 
-        print(f"[INFERENCE] Running MPNN-only step for run_id={run_id} (effective_num_seqs={effective_num_seqs})")
+        print(f"[INFERENCE] Running MPNN-only step for run_id={run_id} (effective_num_seqs={params.num_seqs})")
         code, out, err = run_script(SCRIPT_MPNN, mpnn_args)
         if code != 0:
             # Error en MPNN
