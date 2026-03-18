@@ -692,6 +692,12 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                         continue
                     seq = row.get("seq")
                     mpnn_val = row.get("mpnn")
+                    # Debug/EDA: log generated sequence and its ProteinMPNN score before saving
+                    print(
+                        f"[MPNN] run_id={run_id} n={n} mpnn={mpnn_val} seq={seq}",
+                        flush=True,
+                    )
+
                     inference_insert_record(
                         run_id,
                         int(n),
