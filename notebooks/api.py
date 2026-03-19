@@ -731,11 +731,21 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                 inference_update_record_metrics(rec_id, None, None, "NO_VIABLE")
                 continue
             energy_score = float(mpnn_val) if mpnn_val is not None else 0.0
+            print(
+                f"[INFERENCE] Input -> run_id={run_id} record_id={rec_id} "
+                f"mpnn={mpnn_val} energy_score={energy_score} seq={seq}",
+                flush=True,
+            )
 
             # Ejecutar modelo de inferencia vía script 4_run_inference.py
             code_inf, out_inf, err_inf = run_script(
                 SCRIPT_INFERENCE_MODEL,
                 [seq, str(energy_score)],
+            )
+            print(
+                f"[INFERENCE] Script raw output -> run_id={run_id} record_id={rec_id} "
+                f"returncode={code_inf} stdout={out_inf!r} stderr={err_inf!r}",
+                flush=True,
             )
             ptm_inf: Optional[float] = None
             i_ptm_inf: Optional[float] = None
@@ -744,6 +754,11 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                     data = ast.literal_eval(out_inf.strip())
                     ptm_inf = float(data.get("ptm")) if data.get("ptm") is not None else None
                     i_ptm_inf = float(data.get("iptm")) if data.get("iptm") is not None else None
+                    print(
+                        f"[INFERENCE] Parsed output -> run_id={run_id} record_id={rec_id} "
+                        f"ptm={ptm_inf} i_ptm={i_ptm_inf}",
+                        flush=True,
+                    )
                 except Exception:
                     print(f"[INFERENCE] WARNING: could not parse inference output for record id={rec_id}, run_id={run_id}: {out_inf!r}")
                     ptm_inf = None
