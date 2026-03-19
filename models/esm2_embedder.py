@@ -18,7 +18,7 @@ class ESM2Embedder:
     a NumPy array of shape (N, D) for N sequences.
     """
 
-    def __init__(self, model_name: str = "esm2_t33_650M_UR50D", device: torch.device | str = "cpu", batch_size: int = 1):
+    def __init__(self, model_name: str = "esm2_t12_35M_UR50D", device: torch.device | str = "cpu", batch_size: int = 1):
         self.device = torch.device(device)
         self.batch_size = batch_size
 
