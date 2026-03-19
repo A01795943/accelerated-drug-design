@@ -38,7 +38,11 @@ def run_inference(sequence: str, energy_score: float) -> dict:
         # Embedding
         with contextlib.redirect_stdout(io.StringIO()):
             embeddings = EMBEDDER.embed([clean_sequence])
-            X_emb = embeddings.numpy()
+            # Support both torch.Tensor and numpy.ndarray outputs
+            if hasattr(embeddings, "numpy"):
+                X_emb = embeddings.numpy()
+            else:
+                X_emb = np.asarray(embeddings)
 
         # Concatenar score
         X_final = np.hstack([X_emb, [[float(energy_score)]]])
