@@ -25,7 +25,7 @@ class ESM2Embedder:
         # Load pretrained model and Alphabet/batch converter.
         self.model, self.alphabet = esm.pretrained.__dict__[model_name]()
         self.model = self.model.to(self.device)
-        self.model.eval()a
+        self.model.eval()
         self.batch_converter = self.alphabet.get_batch_converter()
 
     @torch.no_grad()
