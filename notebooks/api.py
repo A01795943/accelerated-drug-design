@@ -752,7 +752,7 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                 print(f"[INFERENCE] Surrogate inference failed for record id={rec_id}, run_id={run_id}: returncode={code_inf}, stderr={err_inf}")
 
             # Decidir viabilidad usando predicted_ptm / predicted_i_ptm
-            if ptm_inf is not None and i_ptm_inf is not None and ptm_inf >= 0.6 and i_ptm_inf >= 0.6:
+            if ptm_inf is not None and i_ptm_inf is not None and ptm_inf >= 0.7 and i_ptm_inf >= 0.7:
                 status = "VIABLE"
             else:
                 status = "NO_VIABLE"
@@ -891,6 +891,7 @@ def inference_status(run_id: str):
         raise HTTPException(status_code=404, detail=f"No inference run found for run_id '{run_id}'")
     path = get_run_status_db_path()
     with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
         cur = conn.execute(
             "SELECT status, error_details, created_at, completed_at FROM inference_jobs WHERE run_id = ?",
             (run_id,),
