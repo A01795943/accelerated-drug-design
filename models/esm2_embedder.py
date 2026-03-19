@@ -27,6 +27,8 @@ class ESM2Embedder:
         self.model = self.model.to(self.device)
         self.model.eval()
         self.batch_converter = self.alphabet.get_batch_converter()
+        # Use model's last layer dynamically (e.g. 12, 33, etc.).
+        self.repr_layer = int(getattr(self.model, "num_layers", 12))
 
     @torch.no_grad()
     def embed(self, sequences: list[str]) -> np.ndarray:
@@ -47,9 +49,19 @@ class ESM2Embedder:
             _, _, tokens = self.batch_converter(batch_data)
             tokens = tokens.to(self.device)
 
-            # Extract CLS representations (index 0)
-            out = self.model(tokens, repr_layers=[33], return_contacts=False)
-            token_representations = out["representations"][33]
+            # Extract CLS representations (index 0) from selected repr layer
+            out = self.model(tokens, repr_layers=[self.repr_layer], return_contacts=False)
+            reps = out.get("representations", {})
+            if self.repr_layer in reps:
+                token_representations = reps[self.repr_layer]
+            elif str(self.repr_layer) in reps:
+                token_representations = reps[str(self.repr_layer)]
+            elif reps:
+                # Fallback: pick highest available layer key
+                key = max(reps.keys(), key=lambda k: int(k))
+                token_representations = reps[key]
+            else:
+                raise RuntimeError("ESM output does not include representations")
             cls_reprs = token_representations[:, 0, :].cpu().numpy()
             all_embeddings.append(cls_reprs)
 
