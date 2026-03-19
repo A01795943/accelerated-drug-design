@@ -459,138 +459,112 @@ def run_alphafold_only(
     rm_aa: str = "C",
 ) -> dict:
     """
-    Validate a single sequence with AlphaFold only (no new ProteinMPNN sampling).
+    Run AlphaFold validation for a single sequence (no ProteinMPNN).
 
-    Uses the same protocol/contig logic as mpnn_diverse_af, but:
-      - Takes the provided sequence `seq` and energy score `mpnn_score`.
-      - Runs AlphaFold once on that sequence.
-      - Returns the AF metrics as a dict with keys:
-        plddt, ptm, i_ptm, pae, rmsd.
+    Returns:
+      - plddt
+      - ptm
+      - i_ptm
+      - pae
+      - rmsd
     """
-    # Resolve PDB path
+
     if pdb_file is None:
         pdb_file = f"{OUTPUTS_DIR}/{run_name}_0.pdb"
     else:
         pdb_file = os.path.abspath(pdb_file)
+
     if not os.path.exists(pdb_file):
-        print(f"❌ No se encuentra el archivo PDB: {pdb_file}")
-        return {
-            "plddt": None,
-            "ptm": None,
-            "i_ptm": None,
-            "pae": None,
-            "rmsd": None,
-        }
+        return {"error": f"No se encuentra el archivo PDB: {pdb_file}"}
 
-    # Normalize rm_aa
-    if rm_aa == "":
-        rm_aa = None
+    output_dir = f"{OUTPUTS_DIR}/{run_name}_af_only"
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Parse contigs (same logic as mpnn_diverse_af)
-    contigs_list = []
     contigs_str = ":".join(contigs) if isinstance(contigs, list) else str(contigs)
-    for contig_str in contigs_str.replace(" ", ":").replace(",", ":").split(":"):
-        if len(contig_str) > 0:
-            sub = []
-            for x in contig_str.split("/"):
-                if x != "0":
-                    sub.append(x)
-            contigs_list.append("/".join(sub))
 
-    chains = alphabet_list[: len(contigs_list)]
-    info = [get_info(x) for x in contigs_list]
-    fixed_pos: list[int] = []
-    fixed_chains: list[bool] = []
-    free_chains: list[bool] = []
-    both_chains: list[bool] = []
-    for pos, (fixed_chain, free_chain) in info:
-        fixed_pos += pos
-        fixed_chains.append(fixed_chain and not free_chain)
-        free_chains.append(free_chain and not fixed_chain)
-        both_chains.append(fixed_chain and free_chain)
+    # 🔹 Creamos un FASTA temporal con la secuencia
+    fasta_path = os.path.join(output_dir, "input.fasta")
+    with open(fasta_path, "w") as f:
+        f.write(f">query\n{seq}\n")
 
-    flags = {
-        "initial_guess": initial_guess,
-        "best_metric": "rmsd",
-        "use_multimer": use_multimer,
-        "model_names": ["model_1_multimer_v3" if use_multimer else "model_1_ptm"],
-    }
+    # 🔹 Script AlphaFold-only dinámico
+    af_script = f"""
+import os
+import json
+import numpy as np
+from colabdesign.af import mk_af_model
 
-    # Build AF model and prep flags (binder / partial / fixbb)
-    if sum(both_chains) == 0 and sum(fixed_chains) > 0 and sum(free_chains) > 0:
-        protocol = "binder"
-        print("protocol=binder (AF only)")
-        target_chains = [chains[n] for n, x in enumerate(fixed_chains) if x]
-        binder_chains = [chains[n] for n, x in enumerate(fixed_chains) if not x]
-        af_model = mk_af_model(protocol="binder", **flags)
-        prep_flags = {
-            "target_chain": ",".join(target_chains),
-            "binder_chain": ",".join(binder_chains),
-            "rm_aa": rm_aa,
+pdb_file = "{pdb_file}"
+seq = "{seq}"
+output_dir = "{output_dir}"
+copies = {copies}
+num_recycles = {num_recycles}
+initial_guess = {initial_guess}
+use_multimer = {use_multimer}
+
+flags = {{
+    "initial_guess": initial_guess,
+    "use_multimer": use_multimer,
+    "num_recycles": num_recycles,
+    "model_names": ["model_1_multimer_v3" if use_multimer else "model_1_ptm"]
+}}
+
+af_model = mk_af_model(protocol="fixbb", **flags)
+
+af_model.prep_inputs(pdb_file, chain="A", copies=copies, homooligomer=copies>1)
+
+af_model.predict(seq=seq)
+
+result = {{
+    "plddt": float(np.mean(af_model.aux["plddt"])),
+    "ptm": float(af_model.aux.get("ptm", 0.0)),
+    "i_ptm": float(af_model.aux.get("i_ptm", 0.0)),
+    "pae": float(np.mean(af_model.aux.get("pae", [0]))),
+    "rmsd": float(af_model.aux.get("rmsd", 0.0))
+}}
+
+with open(os.path.join(output_dir, "af_result.json"), "w") as f:
+    json.dump(result, f)
+
+print(json.dumps(result))
+"""
+
+    temp_script_path = "/tmp/af_only.py"
+    with open(temp_script_path, "w") as f:
+        f.write(af_script)
+
+    print("=" * 60)
+    print(" ALPHAFOLD ONLY VALIDATION")
+    print("=" * 60)
+    print(f"   PDB: {pdb_file}")
+    print(f"   Output: {output_dir}")
+    print("=" * 60)
+
+    try:
+        result = subprocess.run(
+            ["python3", temp_script_path],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd="/workspace"
+        )
+
+        # 🔹 Parsear salida JSON
+        output = json.loads(result.stdout.strip().split("\n")[-1])
+
+        return output
+
+    except subprocess.CalledProcessError as e:
+        return {
+            "error": str(e),
+            "stdout": e.stdout,
+            "stderr": e.stderr
         }
-    elif sum(fixed_pos) > 0:
-        protocol = "partial"
-        print("protocol=partial (AF only)")
-        af_model = mk_af_model(protocol="fixbb", use_templates=True, **flags)
-        rm_template = np.array(fixed_pos) == 0
-        prep_flags = {
-            "chain": ",".join(chains),
-            "rm_template": rm_template,
-            "rm_template_seq": rm_template,
-            "copies": copies,
-            "homooligomer": copies > 1,
-            "rm_aa": rm_aa,
-        }
-    else:
-        protocol = "fixbb"
-        print("protocol=fixbb (AF only)")
-        af_model = mk_af_model(protocol="fixbb", **flags)
-        prep_flags = {
-            "chain": ",".join(chains),
-            "copies": copies,
-            "homooligomer": copies > 1,
-            "rm_aa": rm_aa,
-        }
-
-    # Prepare AF inputs
-    af_model.prep_inputs(pdb_file, **prep_flags)
-    if protocol == "partial":
-        p = np.where(fixed_pos)[0]
-        af_model.opt["fix_pos"] = p[p < af_model._len]
-
-    # Use provided sequence (trimmed to AF length, removing '/')
-    sub_seq = seq.replace("/", "")[-af_model._len :]
-    print(f"Running AlphaFold-only on provided sequence (len={len(sub_seq)}) with mpnn_score={mpnn_score:.3f}")
-    af_model.predict(seq=sub_seq, num_recycles=num_recycles, verbose=False)
-
-    # Extract metrics
-    log = af_model.aux.get("log", {})
-    metrics = {
-        "plddt": None,
-        "ptm": None,
-        "i_ptm": None,
-        "pae": None,
-        "rmsd": None,
-    }
-    # Terms of interest
-    af_terms = ["plddt", "ptm", "i_ptm", "pae", "rmsd"]
-    for t in af_terms:
-        if t not in log:
-            continue
-        val = log[t]
-        # Same scaling as mpnn_diverse_af for pae / i_pae
-        if t in ("pae", "i_pae"):
-            val = val * 31
-        try:
-            metrics_name = t if t != "i_pae" else "pae"
-            if isinstance(val, (list, tuple, np.ndarray)):
-                metrics[metrics_name] = float(np.asarray(val).mean())
-            else:
-                metrics[metrics_name] = float(val)
-        except Exception:
-            continue
-
-    return metrics
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        if os.path.exists(temp_script_path):
+            os.remove(temp_script_path)
 
 
 def main():
