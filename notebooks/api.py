@@ -416,7 +416,7 @@ class RFdiffusionParams(BaseModel):
     run_name: str = Field(default="pipeline_run", description="Job name; used for output filenames")
     pdb_content: Optional[str] = Field(default=None, description="Full PDB file content (text); if set, used instead of pdb ID")
     contigs: str = "12-15/0 R311-337"
-    pdb: str = "6B3J"
+    pdb: str = "4Z18"
     iterations: int = 30
     num_designs: int = 1
     hotspot: str = "R312,R313,R314,R315"
@@ -548,11 +548,13 @@ def run_rfdiffusion(params: RFdiffusionParams):
         raise HTTPException(status_code=500, detail=f"Script not found: {SCRIPT_RFDIFFUSION}")
     cmd = ["python3", str(SCRIPT_RFDIFFUSION)] + args
     logger.info("POST /run/rfdiffusion launching cmd=%s", " ".join(cmd))
+    log_file = OUTPUTS / f"{params.run_id}_rfdiffusion.log"
+    fh = open(log_file, "w")
     subprocess.Popen(
         cmd,
         cwd=str(WORKSPACE),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stdout=fh,
+        stderr=subprocess.STDOUT,
     )
     return {"status": "accepted", "run_id": params.run_id}
 
@@ -622,11 +624,13 @@ def run_mpnn(params: MPNNParams):
             raise HTTPException(status_code=500, detail=f"Script not found: {SCRIPT_MPNN}")
         cmd = ["python3", str(SCRIPT_MPNN)] + args
         logger.info("POST /run/mpnn (async) launching cmd=%s", " ".join(cmd))
+        log_file_mpnn = OUTPUTS / f"{run_id}_mpnn.log"
+        fh_mpnn = open(log_file_mpnn, "w")
         subprocess.Popen(
             cmd,
             cwd=str(WORKSPACE),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=fh_mpnn,
+            stderr=subprocess.STDOUT,
         )
         return {"status": "accepted", "run_id": run_id}
     code, out, err = run_script(SCRIPT_MPNN, args)
