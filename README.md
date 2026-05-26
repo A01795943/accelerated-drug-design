@@ -1,6 +1,6 @@
-# Drug Design for Diabetes (Team 29)
+# Accelerated Drug Design
 
-Este repositorio contiene el trabajo del Equipo 29 para el proyecto del curso de Maestría en Inteligencia Artificial Aplicada. El objetivo es diseñar candidatos terapéuticos para **diabetes**, combinando métodos generativos de proteínas con modelos de aprendizaje automático para evaluar sus propiedades.
+Este repositorio contiene el trabajo del Equipo 2 para el proyecto del curso de Maestría en Inteligencia Artificial Aplicada. El objetivo es diseñar candidatos terapéuticos para **cualquier enfermedad**, combinando métodos generativos de proteínas con modelos de aprendizaje automático para evaluar sus propiedades.
 
 ---
 
@@ -64,12 +64,12 @@ Todos los ejemplos asumen que ejecutas **dentro del contenedor**, con `WORKDIR` 
 
 ### Pipeline numerado (uso recomendado)
 
-| Script | Rol |
-|--------|-----|
-| `1_run_rfdiffusion.py` | Paso 1: genera backbones con RFdiffusion. Escribe PDBs en `/workspace/outputs/{run_name}_0.pdb` (y `_1`, … si hay varios diseños). |
-| `2_run_mpnn_af.py` | Paso 2: ProteinMPNN; con `--use_alphafold` añade validación AlphaFold (vía `mpnn_diverse_af.py`). Salida bajo `/workspace/outputs/{run_name}/`. |
-| `3_run_rosetta.py` | Paso 3: análisis de estabilidad con PyRosetta (FastRelax, energías). Busca PDBs en `outputs/{run_name}/all_pdb`, `outputs/{run_name}/*.pdb` o `outputs/{run_name}_0.pdb`. |
-| `4_run_inference.py` | Paso 4: predicción **ptm** / **iptm** con el modelo entrenado (`model.pkl` en la raíz del repo). |
+| Script                 | Rol                                                                                                                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `1_run_rfdiffusion.py` | Paso 1: genera backbones con RFdiffusion. Escribe PDBs en `/workspace/outputs/{run_name}_0.pdb` (y `_1`, … si hay varios diseños).                                        |
+| `2_run_mpnn_af.py`     | Paso 2: ProteinMPNN; con `--use_alphafold` añade validación AlphaFold (vía `mpnn_diverse_af.py`). Salida bajo `/workspace/outputs/{run_name}/`.                           |
+| `3_run_rosetta.py`     | Paso 3: análisis de estabilidad con PyRosetta (FastRelax, energías). Busca PDBs en `outputs/{run_name}/all_pdb`, `outputs/{run_name}/*.pdb` o `outputs/{run_name}_0.pdb`. |
+| `4_run_inference.py`   | Paso 4: predicción **ptm** / **iptm** con el modelo entrenado (`model.pkl` en la raíz del repo).                                                                          |
 
 **Ejemplo mínimo encadenado por nombre de corrida** (`run_name` coherente en todos los pasos):
 
