@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import sys
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,12 @@ WORKSPACE = Path("/workspace")
 REPO = WORKSPACE / "repo"
 NOTEBOOKS = REPO / "notebooks"
 OUTPUTS = WORKSPACE / "outputs"
+LOGS = WORKSPACE / "logs"
+
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from common.logger import get_log_path, get_logger, log_subprocess_result, resolve_run_id, run_env_for_child
 
 SCRIPT_RFDIFFUSION = NOTEBOOKS / "1_run_rfdiffusion.py"
 SCRIPT_MPNN = NOTEBOOKS / "2_run_mpnn_af.py"
@@ -380,7 +387,12 @@ def inference_update_record_af_metrics(
         conn.commit()
 
 
-def run_script(script: Path, args: list[str], timeout: int = STEP_TIMEOUT) -> tuple[int, str, str]:
+def run_script(
+    script: Path,
+    args: list[str],
+    timeout: int = STEP_TIMEOUT,
+    run_id: Optional[str] = None,
+) -> tuple[int, str, str]:
     """Run a Python script from /workspace; return (returncode, stdout, stderr)."""
     if not script.exists():
         raise HTTPException(
@@ -389,21 +401,37 @@ def run_script(script: Path, args: list[str], timeout: int = STEP_TIMEOUT) -> tu
         )
     cmd = ["python3", str(script)] + args
     logger.info("run_script cmd=%s", " ".join(cmd))
+    run_log = get_logger(run_id, "api.py") if run_id else None
+    if run_log:
+        run_log.info("run_script starting: %s", " ".join(cmd))
+    env = run_env_for_child(run_id) if run_id else None
     try:
+        import time as _time
+
+        t0 = _time.time()
         proc = subprocess.run(
             cmd,
             cwd=str(WORKSPACE),
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
+        if run_log:
+            log_subprocess_result(
+                run_log, proc, cmd, label=script.name, elapsed_sec=_time.time() - t0
+            )
         if proc.returncode != 0:
             logger.info("run_script FAILED returncode=%d stderr=%s", proc.returncode, proc.stderr)
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired:
+        if run_log:
+            run_log.error("run_script TIMEOUT after %s seconds: %s", timeout, " ".join(cmd))
         logger.info("run_script TIMEOUT cmd=%s", " ".join(cmd))
         return -1, "", "Step timed out"
     except Exception as e:
+        if run_log:
+            run_log.exception("run_script exception: %s", e)
         logger.info("run_script EXCEPTION cmd=%s error=%s", " ".join(cmd), e)
         return -1, "", str(e)
 
@@ -412,7 +440,10 @@ def run_script(script: Path, args: list[str], timeout: int = STEP_TIMEOUT) -> tu
 
 
 class RFdiffusionParams(BaseModel):
-    run_id: str = Field(..., description="Unique run ID; must not already exist for RD_DIFFUSION")
+    run_id: Optional[str] = Field(
+        default=None,
+        description="Unique run ID; generated via UUID if omitted; must not already exist for RD_DIFFUSION",
+    )
     run_name: str = Field(default="pipeline_run", description="Job name; used for output filenames")
     pdb_content: Optional[str] = Field(default=None, description="Full PDB file content (text); if set, used instead of pdb ID")
     contigs: str = "12-15/0 R311-337"
@@ -514,19 +545,28 @@ def startup():
 @app.post("/run/rfdiffusion")
 def run_rfdiffusion(params: RFdiffusionParams):
     """Run step 1: RFdiffusion backbone generation (async). Status stored in DB; poll GET /run/rfdiffusion/status/{run_id}."""
-    logger.info("POST /run/rfdiffusion payload=%s", params.dict())
-    if run_status_exists(params.run_id, TASK_RD_DIFFUSION):
-        raise HTTPException(status_code=409, detail=f"run_id '{params.run_id}' already exists for task {TASK_RD_DIFFUSION}")
-    run_status_insert(params.run_id, TASK_RD_DIFFUSION, STATUS_RUNNING)
+    run_id = resolve_run_id(params.run_id)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    run_log = get_logger(run_id, "api.py")
+    run_log.info("POST /run/rfdiffusion started")
+    run_log.info("Request parameters: %s", params.dict())
+    run_log.info("Centralized log file: %s", get_log_path(run_id))
+
+    if run_status_exists(run_id, TASK_RD_DIFFUSION):
+        run_log.warning("Duplicate run_id rejected: %s", run_id)
+        raise HTTPException(status_code=409, detail=f"run_id '{run_id}' already exists for task {TASK_RD_DIFFUSION}")
+    run_status_insert(run_id, TASK_RD_DIFFUSION, STATUS_RUNNING)
+    run_log.info("run_status inserted: task=%s status=%s", TASK_RD_DIFFUSION, STATUS_RUNNING)
 
     pdb_arg = params.pdb
     if params.pdb_content and params.pdb_content.strip():
-        pdb_path = OUTPUTS / f"{params.run_id}_input.pdb"
+        pdb_path = OUTPUTS / f"{run_id}_input.pdb"
         pdb_path.write_text(params.pdb_content.strip(), encoding="utf-8")
         pdb_arg = str(pdb_path)
+        run_log.info("Input PDB written from pdb_content: %s", pdb_path)
 
     args = [
-        "--run_id", params.run_id,
+        "--run_id", run_id,
         "--run_status_db", str(get_run_status_db_path()),
         "--run_name", params.run_name,
         "--contigs", params.contigs,
@@ -544,29 +584,38 @@ def run_rfdiffusion(params: RFdiffusionParams):
         args.extend(["--chains", params.chains])
 
     if not SCRIPT_RFDIFFUSION.exists():
-        run_status_update(params.run_id, TASK_RD_DIFFUSION, STATUS_ERROR, error_details="Script not found")
+        run_status_update(run_id, TASK_RD_DIFFUSION, STATUS_ERROR, error_details="Script not found")
+        run_log.error("Script not found: %s", SCRIPT_RFDIFFUSION)
         raise HTTPException(status_code=500, detail=f"Script not found: {SCRIPT_RFDIFFUSION}")
     cmd = ["python3", str(SCRIPT_RFDIFFUSION)] + args
-    logger.info("POST /run/rfdiffusion launching cmd=%s", " ".join(cmd))
-    log_file = OUTPUTS / f"{params.run_id}_rfdiffusion.log"
-    fh = open(log_file, "w")
-    subprocess.Popen(
-        cmd,
-        cwd=str(WORKSPACE),
-        stdout=fh,
-        stderr=subprocess.STDOUT,
-    )
-    return {"status": "accepted", "run_id": params.run_id}
+    run_log.info("Launching subprocess: %s", " ".join(cmd))
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=str(WORKSPACE),
+            env=run_env_for_child(run_id),
+        )
+        run_log.info("Subprocess started (async); child inherits RUN_ID=%s LOG_DIR=%s", run_id, LOGS)
+    except Exception:
+        run_log.exception("Failed to launch subprocess")
+        run_status_update(run_id, TASK_RD_DIFFUSION, STATUS_ERROR, error_details="Failed to launch worker")
+        raise
+    run_log.info("POST /run/rfdiffusion accepted run_id=%s", run_id)
+    return {"status": "accepted", "run_id": run_id, "log_file": str(get_log_path(run_id))}
 
 
 @app.get("/run/rfdiffusion/status/{run_id}")
 def rfdiffusion_status(run_id: str):
     """Get RFdiffusion run status by run_id. When COMPLETED, includes PDB content of backbones; when ERROR, includes error_details."""
     logger.info("GET /run/rfdiffusion/status/%s", run_id)
+    run_log = get_logger(run_id, "api.py")
+    run_log.info("GET /run/rfdiffusion/status/%s", run_id)
     row = run_status_get(run_id, TASK_RD_DIFFUSION)
     if row is None:
+        run_log.warning("No run found for run_id=%s", run_id)
         raise HTTPException(status_code=404, detail=f"No run found for run_id '{run_id}'")
     response = dict(row)
+    run_log.info("Status response: status=%s", response.get("status"))
     if response.get("status") == STATUS_COMPLETED and response.get("output_pdbs") and isinstance(response["output_pdbs"], dict):
         content = {}
         for key, path in response["output_pdbs"].items():
@@ -574,11 +623,15 @@ def rfdiffusion_status(run_id: str):
             if p and p.exists():
                 try:
                     content[key] = p.read_text(encoding="utf-8")
+                    run_log.info("Attached PDB content for key=%s path=%s", key, p)
                 except Exception:
+                    run_log.exception("Failed to read PDB for key=%s path=%s", key, p)
                     content[key] = None
             else:
+                run_log.warning("PDB path missing for key=%s path=%s", key, path)
                 content[key] = None
         response["output_pdbs_content"] = content
+    response["log_file"] = str(get_log_path(run_id))
     return response
 
 
@@ -1031,12 +1084,17 @@ def run_pipeline(params: PipelineParams):
     logger.info("POST /run/pipeline payload=%s", params.dict())
     run_name = params.run_name
     timeout = params.timeout_per_step
+    pipeline_run_id = uuid.uuid4().hex
+    LOGS.mkdir(parents=True, exist_ok=True)
+    pipeline_log = get_logger(pipeline_run_id, "api.py")
+    pipeline_log.info("POST /run/pipeline started run_name=%s pipeline_run_id=%s", run_name, pipeline_run_id)
     results = {}
 
     # Step 1
     code1, out1, err1 = run_script(
         SCRIPT_RFDIFFUSION,
         [
+            "--run_id", pipeline_run_id,
             "--run_name", run_name,
             "--contigs", params.contigs_rfdiffusion,
             "--pdb", params.pdb,
@@ -1046,6 +1104,7 @@ def run_pipeline(params: PipelineParams):
             "--chain_to_remove", params.chain_to_remove or "",
         ],
         timeout=timeout,
+        run_id=pipeline_run_id,
     )
     results["rfdiffusion"] = {"returncode": code1, "stdout": out1, "stderr": err1}
     if code1 != 0:
@@ -1078,4 +1137,11 @@ def run_pipeline(params: PipelineParams):
         logger.info("POST /run/pipeline step=rosetta FAILED returncode=%d stderr=%s", code3, err3)
         raise HTTPException(status_code=500, detail={"step": "rosetta", "results": results})
 
-    return {"status": "ok", "run_name": run_name, "results": results}
+    pipeline_log.info("POST /run/pipeline completed successfully run_name=%s", run_name)
+    return {
+        "status": "ok",
+        "run_name": run_name,
+        "pipeline_run_id": pipeline_run_id,
+        "log_file": str(get_log_path(pipeline_run_id)),
+        "results": results,
+    }
