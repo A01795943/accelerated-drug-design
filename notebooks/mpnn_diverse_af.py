@@ -3,12 +3,20 @@ MPNN with diverse sampling (one sequence per random seed) + AlphaFold evaluation
 Called by 2_run_mpnn_af.py when --use_alphafold to get different sequences and pLDDT/ptm/pae/rmsd.
 Usage: python3 mpnn_diverse_af.py --pdb=... --loc=... --contig=... [--num_seqs=8] [--mpnn_sampling_temp=0.7] ...
 """
+import argparse
 import os
 import sys
-import argparse
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from common.logger import get_logger, resolve_run_id
 
 # ColabDesign must be on path (caller sets cwd=/workspace and path)
 sys.path.insert(0, "/workspace/colabdesign")
@@ -50,7 +58,17 @@ def main():
     parser.add_argument("--use_multimer", action="store_true", default=True)
     parser.add_argument("--initial_guess", action="store_true", default=False)
     parser.add_argument("--num_designs", type=int, default=1)
+    parser.add_argument("--run_id", "--run-id", dest="run_id", type=str, default=None)
     args = parser.parse_args()
+
+    run_id = resolve_run_id(args.run_id)
+    run_logger = get_logger(run_id, "mpnn_diverse_af.py")
+    run_logger.info("mpnn_diverse_af.py started")
+    run_logger.info(
+        "Parameters: pdb=%s loc=%s contig=%s num_seqs=%s temp=%s",
+        args.pdb, args.loc, args.contig, args.num_seqs, args.mpnn_sampling_temp,
+    )
+    t0 = time.time()
 
     if args.rm_aa == "":
         args.rm_aa = None
@@ -198,7 +216,11 @@ def main():
     labels = ["design", "n", "mpnn"] + (available_terms or [t for t in af_terms if t in (data[0] if data else {})]) + ["seq"]
     df = pd.DataFrame(data, columns=labels)
     df.to_csv(f"{args.loc}/mpnn_results.csv", index=False)
-    print(f"Saved {args.loc}/mpnn_results.csv and design.fasta with {len(data)} diverse sequences + AF metrics.")
+    run_logger.info(
+        "Saved %s/mpnn_results.csv and design.fasta with %d sequences in %.2f seconds",
+        args.loc, len(data), time.time() - t0,
+    )
+    run_logger.info("mpnn_diverse_af.py finished")
 
 
 if __name__ == "__main__":

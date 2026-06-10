@@ -1,77 +1,104 @@
+import argparse
+import contextlib
+import io
+import json
+import os
+import sys
+import time
 import warnings
+from pathlib import Path
+
+import joblib
+import numpy as np
+import torch
+
 warnings.filterwarnings("ignore")
 
-import sys, os, joblib, numpy as np, torch, contextlib, io
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# Configurar rutas
-base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(base_path)
-
+from common.logger import get_logger, resolve_run_id
 from models.esm2_embedder import ESM2Embedder
 
-# Cache global
+base_path = _REPO_ROOT
+PROCESS_NAME = "4_run_inference.py"
+
 MODEL = None
 EMBEDDER = None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def load_resources():
-    """Carga el modelo y el embedder una sola vez"""
+def load_resources(logger=None):
+    """Load model and embedder once."""
     global MODEL, EMBEDDER
 
     if MODEL is None:
         model_path = os.path.join(base_path, "model.pkl")
+        if logger:
+            logger.info("Loading model from %s", model_path)
         MODEL = joblib.load(model_path)
 
     if EMBEDDER is None:
+        if logger:
+            logger.info("Loading ESM2 embedder on device=%s", DEVICE)
         with contextlib.redirect_stdout(io.StringIO()):
             EMBEDDER = ESM2Embedder(device=DEVICE, batch_size=1)
 
 
-def run_inference(sequence: str, energy_score: float) -> dict:
-    """Regresa únicamente ptm e iptm"""
+def run_inference(sequence: str, energy_score: float, logger=None) -> dict:
+    """Return ptm and iptm predictions."""
     clean_sequence = sequence.replace("/", "")
+    if logger:
+        logger.info("Inference started seq_len=%d energy_score=%s", len(clean_sequence), energy_score)
 
     try:
-        load_resources()
+        load_resources(logger)
 
-        # Embedding
         with contextlib.redirect_stdout(io.StringIO()):
             embeddings = EMBEDDER.embed([clean_sequence])
-            # Support both torch.Tensor and numpy.ndarray outputs
             if hasattr(embeddings, "numpy"):
                 X_emb = embeddings.numpy()
             else:
                 X_emb = np.asarray(embeddings)
 
-        # Concatenar score
         X_final = np.hstack([X_emb, [[float(energy_score)]]])
-
-        # Predicción
         preds = MODEL.predict(X_final)
-
-        return {
+        result = {
             "ptm": round(float(preds[0][0]), 4),
-            "iptm": round(float(preds[0][1]), 4)
+            "iptm": round(float(preds[0][1]), 4),
         }
+        if logger:
+            logger.info("Inference result: %s", result)
+        return result
+    except Exception as exc:
+        if logger:
+            logger.exception("Inference failed: %s", exc)
+        return {"ptm": None, "iptm": None, "error": str(exc)}
 
-    except Exception as e:
-        return {
-            "ptm": None,
-            "iptm": None,
-            "error": str(e)
-        }
+
+def main():
+    parser = argparse.ArgumentParser(description="Step 4: surrogate ptm/iptm inference")
+    parser.add_argument("--run_id", "--run-id", dest="run_id", type=str, default=None)
+    parser.add_argument("sequence", nargs="?", default=None)
+    parser.add_argument("energy_score", nargs="?", default=None)
+    args = parser.parse_args()
+
+    run_id = resolve_run_id(args.run_id)
+    run_logger = get_logger(run_id, PROCESS_NAME)
+    run_logger.info("%s started", PROCESS_NAME)
+
+    if args.sequence is None or args.energy_score is None:
+        run_logger.error("Usage: python3 4_run_inference.py [--run_id ID] <sequence> <score>")
+        sys.exit(1)
+
+    run_logger.info("CLI arguments: sequence_len=%d energy_score=%s", len(args.sequence), args.energy_score)
+    t0 = time.time()
+    result = run_inference(args.sequence, float(args.energy_score), logger=run_logger)
+    run_logger.info("Finished in %.2f seconds", time.time() - t0)
+    print(json.dumps(result))
+    sys.exit(0 if result.get("error") is None else 1)
 
 
 if __name__ == "__main__":
-    # Carga única
-    load_resources()
-
-    # Uso: python3 4_run_inference.py "SEC" 1.903
-    if len(sys.argv) < 3:
-        raise ValueError("Uso: python3 4_run_inference.py <secuencia> <score>")
-
-    result = run_inference(sys.argv[1], float(sys.argv[2]))
-
-    # Solo para CLI (opcional)
-    print(result)
+    main()

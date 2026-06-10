@@ -167,3 +167,61 @@ def resolve_run_id(explicit: Optional[str] = None) -> str:
     if rid:
         return rid
     return uuid.uuid4().hex
+
+
+def read_log_content(
+    run_id: str,
+    *,
+    tail: Optional[int] = None,
+    offset: int = 0,
+) -> dict:
+    """
+    Read centralized log file for run_id.
+    Returns dict with content, metadata; raises FileNotFoundError if missing.
+    """
+    log_path = get_log_path(run_id)
+    if not log_path.is_file():
+        raise FileNotFoundError(f"Log file not found for run_id '{run_id}': {log_path}")
+
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    total_lines = len(lines)
+
+    if offset > 0:
+        lines = lines[offset:]
+    if tail is not None and tail > 0:
+        lines = lines[-tail:]
+
+    content = "\n".join(lines)
+    if lines and text.endswith("\n"):
+        content += "\n"
+
+    stat = log_path.stat()
+    return {
+        "run_id": run_id,
+        "log_file": str(log_path),
+        "content": content,
+        "total_lines": total_lines,
+        "returned_lines": len(lines),
+        "offset": offset,
+        "tail": tail,
+        "size_bytes": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def list_run_logs() -> list[dict]:
+    """List available run log files in the logs directory."""
+    log_dir = get_log_dir()
+    if not log_dir.is_dir():
+        return []
+    entries = []
+    for path in sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True):
+        stat = path.stat()
+        entries.append({
+            "run_id": path.stem,
+            "log_file": str(path),
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return entries

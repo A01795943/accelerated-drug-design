@@ -38,7 +38,15 @@ LOGS = WORKSPACE / "logs"
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from common.logger import get_log_path, get_logger, log_subprocess_result, resolve_run_id, run_env_for_child
+from common.logger import (
+    get_log_path,
+    get_logger,
+    list_run_logs,
+    log_subprocess_result,
+    read_log_content,
+    resolve_run_id,
+    run_env_for_child,
+)
 
 SCRIPT_RFDIFFUSION = NOTEBOOKS / "1_run_rfdiffusion.py"
 SCRIPT_MPNN = NOTEBOOKS / "2_run_mpnn_af.py"
@@ -493,6 +501,7 @@ class InferenceParams(BaseModel):
     num_designs: int = 1
 
 class RosettaParams(BaseModel):
+    run_id: Optional[str] = Field(default=None, description="Run ID for centralized logging; generated if omitted")
     run_name: str = Field(default="pipeline_run", description="Must match step 1 and 2 run_name")
 
 
@@ -535,6 +544,26 @@ def hello():
     """Simple GET endpoint to test network config. Returns hello world."""
     logger.info("GET /hello")
     return {"message": "hello world"}
+
+
+@app.get("/logs")
+def list_logs():
+    """List all available per-run log files."""
+    LOGS.mkdir(parents=True, exist_ok=True)
+    return {"logs": list_run_logs(), "log_dir": str(LOGS)}
+
+
+@app.get("/logs/{run_id}")
+def get_run_log(
+    run_id: str,
+    tail: Optional[int] = Query(default=None, ge=1, description="Return only the last N lines"),
+    offset: int = Query(default=0, ge=0, description="Skip the first N lines"),
+):
+    """Return the centralized log content for a run_id."""
+    try:
+        return read_log_content(run_id, tail=tail, offset=offset)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.on_event("startup")
@@ -638,17 +667,25 @@ def rfdiffusion_status(run_id: str):
 @app.post("/run/mpnn")
 def run_mpnn(params: MPNNParams):
     """Run step 2: ProteinMPNN (optional AlphaFold). If run_id is set, runs async and stores status in DB (task MPNN+RF_DIFFUSION). Accepts pdb_content (raw PDB text) or input_pdb path."""
-    logger.info("POST /run/mpnn payload=%s", params.dict())
+    run_id = resolve_run_id(params.run_id)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    run_log = get_logger(run_id, "api.py")
+    run_log.info("POST /run/mpnn started")
+    run_log.info("Request parameters: %s", params.dict())
+
     input_pdb_arg: Optional[str] = None
     if params.pdb_content and params.pdb_content.strip():
-        pdb_name = (params.run_id or params.run_name or "mpnn_input").strip()
+        pdb_name = (run_id or params.run_name or "mpnn_input").strip()
         pdb_path = OUTPUTS / f"{pdb_name}_input.pdb"
         pdb_path.write_text(params.pdb_content.strip(), encoding="utf-8")
         input_pdb_arg = str(pdb_path)
+        run_log.info("Input PDB written from pdb_content: %s", pdb_path)
     elif params.input_pdb and params.input_pdb.strip():
         input_pdb_arg = params.input_pdb.strip()
+        run_log.info("Using input_pdb: %s", input_pdb_arg)
 
     args = [
+        "--run_id", run_id,
         "--run_name", params.run_name,
         "--contigs", params.contigs,
         "--num_seqs", str(params.num_seqs),
@@ -666,31 +703,42 @@ def run_mpnn(params: MPNNParams):
         args.append("--use_multimer")
     args.extend(["--copies", str(params.copies), "--num_recycles", str(params.num_recycles), "--rm_aa", params.rm_aa])
 
-    if params.run_id and params.run_id.strip():
-        run_id = params.run_id.strip()
+    async_mode = bool(params.run_id and params.run_id.strip())
+    if async_mode:
         if run_status_exists(run_id, TASK_MPNN_RF_DIFFUSION):
+            run_log.warning("Duplicate run_id rejected: %s", run_id)
             raise HTTPException(status_code=409, detail=f"run_id '{run_id}' already exists for task {TASK_MPNN_RF_DIFFUSION}")
         run_status_insert(run_id, TASK_MPNN_RF_DIFFUSION, STATUS_RUNNING)
-        args = ["--run_id", run_id, "--run_status_db", str(get_run_status_db_path())] + args
+        args.extend(["--run_status_db", str(get_run_status_db_path())])
         if not SCRIPT_MPNN.exists():
             run_status_update(run_id, TASK_MPNN_RF_DIFFUSION, STATUS_ERROR, error_details="Script not found")
+            run_log.error("Script not found: %s", SCRIPT_MPNN)
             raise HTTPException(status_code=500, detail=f"Script not found: {SCRIPT_MPNN}")
         cmd = ["python3", str(SCRIPT_MPNN)] + args
-        logger.info("POST /run/mpnn (async) launching cmd=%s", " ".join(cmd))
-        log_file_mpnn = OUTPUTS / f"{run_id}_mpnn.log"
-        fh_mpnn = open(log_file_mpnn, "w")
-        subprocess.Popen(
-            cmd,
-            cwd=str(WORKSPACE),
-            stdout=fh_mpnn,
-            stderr=subprocess.STDOUT,
-        )
-        return {"status": "accepted", "run_id": run_id}
-    code, out, err = run_script(SCRIPT_MPNN, args)
+        run_log.info("Launching subprocess (async): %s", " ".join(cmd))
+        try:
+            subprocess.Popen(cmd, cwd=str(WORKSPACE), env=run_env_for_child(run_id))
+            run_log.info("Subprocess started; child inherits RUN_ID=%s", run_id)
+        except Exception:
+            run_log.exception("Failed to launch MPNN subprocess")
+            run_status_update(run_id, TASK_MPNN_RF_DIFFUSION, STATUS_ERROR, error_details="Failed to launch worker")
+            raise
+        run_log.info("POST /run/mpnn accepted run_id=%s", run_id)
+        return {"status": "accepted", "run_id": run_id, "log_file": str(get_log_path(run_id))}
+
+    code, out, err = run_script(SCRIPT_MPNN, args, run_id=run_id)
     if code != 0:
-        logger.info("POST /run/mpnn (sync) FAILED returncode=%d stderr=%s", code, err)
+        run_log.error("POST /run/mpnn (sync) FAILED returncode=%d", code)
         raise HTTPException(status_code=500, detail={"returncode": code, "stdout": out, "stderr": err})
-    return {"status": "ok", "run_name": params.run_name, "stdout": out, "stderr": err}
+    run_log.info("POST /run/mpnn (sync) completed successfully")
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "run_name": params.run_name,
+        "log_file": str(get_log_path(run_id)),
+        "stdout": out,
+        "stderr": err,
+    }
 
 
 def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
@@ -700,8 +748,9 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
     2) Para cada secuencia, llama a 4_run_inference.py para obtener ptm e iptm, decide VIABLE / NO_VIABLE.
     3) Marca el job como COMPLETED o ERROR.
     """
+    run_log = get_logger(run_id, "api.py")
     try:
-        logger.info("[INFERENCE] Starting inference pipeline for run_id=%s", run_id)
+        run_log.info("[INFERENCE] Starting inference pipeline for run_id=%s", run_id)
         params = InferenceParams(**params_dict)
 
         # Preparar input PDB si viene en el request
@@ -744,12 +793,11 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
 
         mpnn_args = ["--run_id", mpnn_run_id, "--run_status_db", str(get_run_status_db_path())] + mpnn_args
 
-        logger.info("[INFERENCE] Running MPNN-only step for run_id=%s (effective_num_seqs=%d)", run_id, params.num_seqs)
-        code, out, err = run_script(SCRIPT_MPNN, mpnn_args)
+        run_log.info("[INFERENCE] Running MPNN-only step for run_id=%s (effective_num_seqs=%d)", run_id, params.num_seqs)
+        code, out, err = run_script(SCRIPT_MPNN, mpnn_args, run_id=run_id)
         if code != 0:
-            # Error en MPNN
             msg = f"MPNN step failed: returncode={code}, stderr={err}"
-            logger.info("[INFERENCE] ERROR in MPNN-only step for run_id=%s: %s", run_id, msg)
+            run_log.error("[INFERENCE] ERROR in MPNN-only step: %s", msg)
             run_status_update(run_id, TASK_INFERENCE, STATUS_ERROR, error_details=msg)
             inference_update_job_completed(run_id, STATUS_ERROR, msg)
             return
@@ -757,7 +805,7 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
         # 1.b) Copiar resultados desde mpnn_run_detail a inference_jobs_records
         # En este modo (sin AlphaFold) solo confiamos en seq y mpnn; el resto de métricas se deja en NULL.
         total_records = mpnn_detail_count(mpnn_run_id)
-        logger.info("[INFERENCE] MPNN-only produced %d records for mpnn_run_id=%s", total_records, mpnn_run_id)
+        run_log.info("[INFERENCE] MPNN-only produced %d records for mpnn_run_id=%s", total_records, mpnn_run_id)
         if total_records > 0:
             total_batches = (total_records + BATCH_SIZE_MPNN - 1) // BATCH_SIZE_MPNN
             for batch in range(total_batches):
@@ -769,7 +817,7 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                     seq = row.get("seq")
                     mpnn_val = row.get("mpnn")
                     # Debug/EDA: log generated sequence and its ProteinMPNN score before saving
-                    logger.info("[MPNN] run_id=%s n=%s mpnn=%s seq=%s", run_id, n, mpnn_val, seq)
+                    run_log.info("[MPNN] run_id=%s n=%s mpnn=%s seq=%s", run_id, n, mpnn_val, seq)
 
                     inference_insert_record(
                         run_id,
@@ -783,7 +831,7 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                         None,  # rmsd
                     )
 
-        logger.info("[INFERENCE] Saved initial inference records for run_id=%s, starting surrogate inference (4_run_inference.py)", run_id)
+        run_log.info("[INFERENCE] Saved initial inference records, starting surrogate inference (4_run_inference.py)")
 
         # 2) Para cada registro, llamar a 4_run_inference.py para obtener ptm / iptm (predicciones del modelo surrogate)
         path = get_run_status_db_path()
@@ -800,23 +848,23 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
             seq = rec["seq"]
             mpnn_val = rec["mpnn"]
             if not seq:
-                logger.info("[INFERENCE] Skipping record id=%s for run_id=%s: empty sequence", rec_id, run_id)
+                run_log.info("[INFERENCE] Skipping record id=%s: empty sequence", rec_id)
                 inference_update_record_metrics(rec_id, None, None, "NO_VIABLE")
                 continue
             energy_score = float(mpnn_val) if mpnn_val is not None else 0.0
-            logger.info(
-                "[INFERENCE] Input -> run_id=%s record_id=%s mpnn=%s energy_score=%s seq=%s",
-                run_id, rec_id, mpnn_val, energy_score, seq,
+            run_log.info(
+                "[INFERENCE] Input -> record_id=%s mpnn=%s energy_score=%s seq=%s",
+                rec_id, mpnn_val, energy_score, seq,
             )
 
-            # Ejecutar modelo de inferencia vía script 4_run_inference.py
             code_inf, out_inf, err_inf = run_script(
                 SCRIPT_INFERENCE_MODEL,
-                [seq, str(energy_score)],
+                ["--run_id", run_id, seq, str(energy_score)],
+                run_id=run_id,
             )
-            logger.info(
-                "[INFERENCE] Script raw output -> run_id=%s record_id=%s returncode=%d stdout=%r stderr=%r",
-                run_id, rec_id, code_inf, out_inf, err_inf,
+            run_log.info(
+                "[INFERENCE] Script raw output -> record_id=%s returncode=%d stdout=%r stderr=%r",
+                rec_id, code_inf, out_inf, err_inf,
             )
             ptm_inf: Optional[float] = None
             i_ptm_inf: Optional[float] = None
@@ -825,25 +873,24 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                     data = ast.literal_eval(out_inf.strip())
                     ptm_inf = float(data.get("ptm")) if data.get("ptm") is not None else None
                     i_ptm_inf = float(data.get("iptm")) if data.get("iptm") is not None else None
-                    logger.info(
-                        "[INFERENCE] Parsed output -> run_id=%s record_id=%s ptm=%s i_ptm=%s",
-                        run_id, rec_id, ptm_inf, i_ptm_inf,
+                    run_log.info(
+                        "[INFERENCE] Parsed output -> record_id=%s ptm=%s i_ptm=%s",
+                        rec_id, ptm_inf, i_ptm_inf,
                     )
                 except Exception:
-                    logger.info("[INFERENCE] WARNING: could not parse inference output for record id=%s, run_id=%s: %r", rec_id, run_id, out_inf)
+                    run_log.warning("[INFERENCE] could not parse inference output for record id=%s: %r", rec_id, out_inf)
                     ptm_inf = None
                     i_ptm_inf = None
             else:
-                logger.info("[INFERENCE] Surrogate inference failed for record id=%s, run_id=%s: returncode=%d, stderr=%s", rec_id, run_id, code_inf, err_inf)
+                run_log.error("[INFERENCE] Surrogate inference failed for record id=%s: returncode=%d stderr=%s", rec_id, code_inf, err_inf)
 
-            # Decidir viabilidad usando predicted_ptm / predicted_i_ptm
             if ptm_inf is not None and i_ptm_inf is not None and ptm_inf >= 0.2 and i_ptm_inf >= 0.2:
                 status = "VIABLE"
             else:
                 status = "NO_VIABLE"
             inference_update_record_metrics(rec_id, ptm_inf, i_ptm_inf, status)
 
-        logger.info("[INFERENCE] Finished surrogate inference for run_id=%s, starting AlphaFold-only for VIABLE sequences", run_id)
+        run_log.info("[INFERENCE] Finished surrogate inference, starting AlphaFold-only for VIABLE sequences")
 
         # 3) Para cada secuencia VIABLE, ejecutar AlphaFold-only para obtener métricas estructurales reales
         #    y guardarlas en las columnas plddt, ptm, i_ptm, pae, rmsd.
@@ -855,7 +902,7 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                 mpnn_af_module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mpnn_af_module)  # type: ignore[assignment]
         except Exception as e:
-            logger.info("[INFERENCE] Could not load 2_run_mpnn_af.py for AlphaFold-only: %s", e)
+            run_log.exception("[INFERENCE] Could not load 2_run_mpnn_af.py for AlphaFold-only: %s", e)
             mpnn_af_module = None
 
         if mpnn_af_module and hasattr(mpnn_af_module, "run_alphafold_only"):
@@ -867,7 +914,7 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                 )
                 viable_rows = cur.fetchall()
 
-            logger.info("[INFERENCE] Found %d VIABLE records for AlphaFold-only, run_id=%s", len(viable_rows), run_id)
+            run_log.info("[INFERENCE] Found %d VIABLE records for AlphaFold-only", len(viable_rows))
 
             for rec in viable_rows:
                 rec_id = rec["id"]
@@ -889,6 +936,8 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                         num_recycles=params.num_recycles,
                         use_multimer=params.use_multimer,
                         rm_aa=params.rm_aa,
+                        run_id=run_id,
+                        logger=run_log,
                     )
                     inference_update_record_af_metrics(
                         rec_id,
@@ -899,22 +948,21 @@ def _run_inference_pipeline_worker(run_id: str, params_dict: dict) -> None:
                         metrics.get("rmsd"),
                     )
                 except Exception as e:
-                    logger.info("[INFERENCE] Error running run_alphafold_only for record %s, run_id=%s: %s", rec_id, run_id, e)
+                    run_log.exception("[INFERENCE] Error running run_alphafold_only for record %s: %s", rec_id, e)
         else:
-            logger.info("[INFERENCE] AlphaFold-only step skipped: run_alphafold_only not available")
+            run_log.info("[INFERENCE] AlphaFold-only step skipped: run_alphafold_only not available")
 
-        # 4) Marcar job como completado
         run_status_update(run_id, TASK_INFERENCE, STATUS_COMPLETED, error_details=None)
         inference_update_job_completed(run_id, STATUS_COMPLETED, None)
+        run_log.info("[INFERENCE] Pipeline completed successfully")
     except Exception as e:
         msg = f"Inference pipeline error: {e}"
+        run_log.exception("[INFERENCE] FATAL ERROR: %s", e)
         try:
             run_status_update(run_id, TASK_INFERENCE, STATUS_ERROR, error_details=msg)
             inference_update_job_completed(run_id, STATUS_ERROR, msg)
         except Exception:
-            # Best-effort; avoid crashing the worker
             pass
-        logger.info("[INFERENCE] FATAL ERROR in inference pipeline for run_id=%s: %s", run_id, e)
 
 
 @app.post("/run/inference")
@@ -926,25 +974,29 @@ def run_inference(params: InferenceParams):
     - Background worker runs MPNN (no AlphaFold), 4_run_inference per sequence,
       updates inference_jobs_records and marks job as completed.
     """
-    logger.info("POST /run/inference payload=%s", params.dict())
-    # Decide run_id
-    run_id = (params.run_id or f"inference_{uuid.uuid4().hex[:8]}").strip()
+    run_id = resolve_run_id(params.run_id or f"inference_{uuid.uuid4().hex[:8]}")
+    LOGS.mkdir(parents=True, exist_ok=True)
+    run_log = get_logger(run_id, "api.py")
+    run_log.info("POST /run/inference started")
+    run_log.info("Request parameters: %s", params.dict())
+
     if run_status_exists(run_id, TASK_INFERENCE):
+        run_log.warning("Duplicate run_id rejected: %s", run_id)
         raise HTTPException(status_code=409, detail=f"run_id '{run_id}' already exists for task {TASK_INFERENCE}")
 
-    # Register job
     run_status_insert(run_id, TASK_INFERENCE, STATUS_RUNNING)
     inference_insert_job(run_id, STATUS_RUNNING, None)
 
-    # Launch background worker
     worker_params = params.dict()
+    worker_params["run_id"] = run_id
     threading.Thread(
         target=_run_inference_pipeline_worker,
         args=(run_id, worker_params),
         daemon=True,
     ).start()
 
-    return {"status": "accepted", "run_id": run_id}
+    run_log.info("POST /run/inference accepted run_id=%s", run_id)
+    return {"status": "accepted", "run_id": run_id, "log_file": str(get_log_path(run_id))}
 
 
 @app.get("/run/mpnn/status/{run_id}")
@@ -955,13 +1007,14 @@ def mpnn_status(run_id: str):
     if row is None:
         raise HTTPException(status_code=404, detail=f"No run found for run_id '{run_id}'")
     if row.get("status") != STATUS_COMPLETED:
-        return row
+        return {**row, "log_file": str(get_log_path(run_id))}
     summary = mpnn_summary_get(run_id)
     total_records = mpnn_detail_count(run_id)
     total_batches = (total_records + BATCH_SIZE_MPNN - 1) // BATCH_SIZE_MPNN if total_records else 0
     return {
         **row,
         "summary": summary or {},
+        "log_file": str(get_log_path(run_id)),
         "pagination": {
             "total_records": total_records,
             "total_batches": total_batches,
@@ -992,6 +1045,7 @@ def inference_status(run_id: str):
         **row,
         "job": job_info,
         "total_records": total_records,
+        "log_file": str(get_log_path(run_id)),
     }
 
 
@@ -1069,13 +1123,25 @@ def mpnn_status_detail(
 @app.post("/run/rosetta")
 def run_rosetta(params: RosettaParams):
     """Run step 3: Rosetta stability analysis on PDBs from {run_name}/ or {run_name}_0.pdb"""
-    logger.info("POST /run/rosetta payload=%s", params.dict())
-    args = ["--run_name", params.run_name]
-    code, out, err = run_script(SCRIPT_ROSETTA, args)
+    run_id = resolve_run_id(params.run_id)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    run_log = get_logger(run_id, "api.py")
+    run_log.info("POST /run/rosetta started")
+    run_log.info("Request parameters: %s", params.dict())
+    args = ["--run_id", run_id, "--run_name", params.run_name]
+    code, out, err = run_script(SCRIPT_ROSETTA, args, run_id=run_id)
     if code != 0:
-        logger.info("POST /run/rosetta FAILED returncode=%d stderr=%s", code, err)
+        run_log.error("POST /run/rosetta FAILED returncode=%d", code)
         raise HTTPException(status_code=500, detail={"returncode": code, "stdout": out, "stderr": err})
-    return {"status": "ok", "run_name": params.run_name, "stdout": out, "stderr": err}
+    run_log.info("POST /run/rosetta completed successfully")
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "run_name": params.run_name,
+        "log_file": str(get_log_path(run_id)),
+        "stdout": out,
+        "stderr": err,
+    }
 
 
 @app.post("/run/pipeline")
@@ -1113,6 +1179,7 @@ def run_pipeline(params: PipelineParams):
 
     # Step 2
     mpnn_args = [
+        "--run_id", pipeline_run_id,
         "--run_name", run_name,
         "--contigs", params.contigs_mpnn,
         "--num_seqs", str(params.num_seqs),
@@ -1120,7 +1187,7 @@ def run_pipeline(params: PipelineParams):
     ]
     if params.use_alphafold:
         mpnn_args.append("--use_alphafold")
-    code2, out2, err2 = run_script(SCRIPT_MPNN, mpnn_args, timeout=timeout)
+    code2, out2, err2 = run_script(SCRIPT_MPNN, mpnn_args, timeout=timeout, run_id=pipeline_run_id)
     results["mpnn"] = {"returncode": code2, "stdout": out2, "stderr": err2}
     if code2 != 0:
         logger.info("POST /run/pipeline step=mpnn FAILED returncode=%d stderr=%s", code2, err2)
@@ -1129,8 +1196,9 @@ def run_pipeline(params: PipelineParams):
     # Step 3
     code3, out3, err3 = run_script(
         SCRIPT_ROSETTA,
-        ["--run_name", run_name],
+        ["--run_id", pipeline_run_id, "--run_name", run_name],
         timeout=timeout,
+        run_id=pipeline_run_id,
     )
     results["rosetta"] = {"returncode": code3, "stdout": out3, "stderr": err3}
     if code3 != 0:

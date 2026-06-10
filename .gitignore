@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# Per-run pipeline logs (generated at runtime)
+logs/
+
 # VSCode
 .vscode/
 /data/traning_alphafold_predictor/

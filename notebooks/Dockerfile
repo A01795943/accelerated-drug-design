@@ -97,7 +97,7 @@ RUN pip install --upgrade "jax[cuda12]" -f https://storage.googleapis.com/jax-re
 RUN pip install --upgrade --force-reinstall "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
 # Crear directorio de outputs
-RUN mkdir -p outputs
+RUN mkdir -p outputs logs
 
 # Copy repo into container (build from repo root: docker build -f notebooks/Dockerfile -t rfdiffusion .)
 COPY . /workspace/repo

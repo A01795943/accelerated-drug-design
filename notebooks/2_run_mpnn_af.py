@@ -14,9 +14,16 @@ import sqlite3
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 from string import ascii_uppercase, ascii_lowercase
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from common.logger import get_logger, log_subprocess_result, resolve_run_id, run_env_for_child
 
 sys.path.append("/workspace/RFdiffusion")
 sys.path.append("/workspace/colabdesign")
@@ -25,6 +32,7 @@ from colabdesign.af import mk_af_model
 from mpnn_diverse_af import get_info
 
 OUTPUTS_DIR = "/workspace/outputs"
+PROCESS_NAME = "2_run_mpnn_af.py"
 TASK_MPNN_RF_DIFFUSION = "MPNN+RF_DIFFUSION"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_ERROR = "ERROR"
@@ -197,6 +205,8 @@ def run_proteinmpnn_alphafold(
     mpnn_sampling_temp: float = 0.1,
     num_designs: int = 1,
     design_num: int = 0,
+    run_id: str | None = None,
+    logger=None,
 ) -> bool:
     """Run ProteinMPNN + AlphaFold validation. Output to /workspace/outputs/{run_name}/."""
     if pdb_file is None:
@@ -204,7 +214,8 @@ def run_proteinmpnn_alphafold(
     else:
         pdb_file = os.path.abspath(pdb_file)
     if not os.path.exists(pdb_file):
-        print(f"❌ No se encuentra el archivo PDB: {pdb_file}")
+        if logger:
+            logger.error("PDB file not found: %s", pdb_file)
         return False
 
     contigs_str = ":".join(contigs) if isinstance(contigs, list) else str(contigs)
@@ -225,28 +236,32 @@ def run_proteinmpnn_alphafold(
         opts.append("--initial_guess")
     if use_multimer:
         opts.append("--use_multimer")
+    if run_id:
+        opts.append(f"--run_id={run_id}")
 
-    # Use diverse MPNN + AF (different sequence per seed) instead of designability_test
     script_dir = os.path.dirname(os.path.abspath(__file__))
     mpnn_diverse_af_script = os.path.join(script_dir, "mpnn_diverse_af.py")
     if not os.path.exists(mpnn_diverse_af_script):
         mpnn_diverse_af_script = "/workspace/repo/notebooks/mpnn_diverse_af.py"
     cmd = ["python3", mpnn_diverse_af_script] + opts
-    print("=" * 60)
-    print(" PROTEINMPNN + ALPHAFOLD VALIDATION (diverse sequences)")
-    print("=" * 60)
-    print(f"   PDB: {pdb_file}")
-    print(f"   Output: {output_dir}")
-    print("=" * 60)
+    if logger:
+        logger.info("ProteinMPNN + AlphaFold validation started pdb=%s output=%s", pdb_file, output_dir)
 
     try:
-        result = subprocess.run(cmd, cwd="/workspace", check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error: {e}")
-        return False
-    except Exception as e:
-        print(f"Error inesperado: {e}")
+        t0 = time.time()
+        result = subprocess.run(
+            cmd,
+            cwd="/workspace",
+            capture_output=True,
+            text=True,
+            env=run_env_for_child(run_id) if run_id else None,
+        )
+        if logger:
+            log_subprocess_result(logger, result, cmd, label="mpnn_diverse_af.py", elapsed_sec=time.time() - t0)
+        return result.returncode == 0
+    except Exception:
+        if logger:
+            logger.exception("ProteinMPNN + AlphaFold failed")
         return False
 
 
@@ -263,6 +278,8 @@ def run_proteinmpnn_only(
     mpnn_sampling_temp: float = 0.1,
     num_designs: int = 1,
     design_num: int = 0,
+    run_id: str | None = None,
+    logger=None,
 ) -> bool:
     """Run ProteinMPNN only (no AlphaFold). Output to /workspace/outputs/{run_name}/."""
     if pdb_file is None:
@@ -270,7 +287,8 @@ def run_proteinmpnn_only(
     else:
         pdb_file = os.path.abspath(pdb_file)
     if not os.path.exists(pdb_file):
-        print(f"❌ No se encuentra el archivo PDB: {pdb_file}")
+        if logger:
+            logger.error("PDB file not found: %s", pdb_file)
         return False
 
     contigs_str = ":".join(contigs) if isinstance(contigs, list) else str(contigs)
@@ -422,27 +440,27 @@ print(f"MPNN only completed. Results saved to {output_dir}")
     with open(temp_script_path, "w") as f:
         f.write(mpnn_only_script)
 
-    print("=" * 60)
-    print(" PROTEINMPNN ONLY (SIN ALPHAFOLD)")
-    print("=" * 60)
-    print(f"   PDB: {pdb_file}")
-    print(f"   Output: {output_dir}")
-    print("=" * 60)
+    if logger:
+        logger.info("ProteinMPNN only started pdb=%s output=%s", pdb_file, output_dir)
 
     try:
-        result = subprocess.run(["python3", temp_script_path], check=True, capture_output=True, text=True, cwd="/workspace")
+        t0 = time.time()
+        result = subprocess.run(
+            ["python3", temp_script_path],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd="/workspace",
+            env=run_env_for_child(run_id) if run_id else None,
+        )
+        if logger:
+            log_subprocess_result(logger, result, ["python3", temp_script_path], label="mpnn_only", elapsed_sec=time.time() - t0)
         if os.path.exists(temp_script_path):
             os.remove(temp_script_path)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error ejecutando MPNN: {e}")
-        if e.stdout:
-            print(f"STDOUT: {e.stdout}")
-        if e.stderr:
-            print(f"STDERR: {e.stderr}")
-        return False
-    except Exception as e:
-        print(f"Error inesperado: {e}")
+        return result.returncode == 0
+    except Exception:
+        if logger:
+            logger.exception("ProteinMPNN only failed")
         return False
 
 
@@ -457,6 +475,8 @@ def run_alphafold_only(
     num_recycles: int = 1,
     use_multimer: bool = True,
     rm_aa: str = "C",
+    run_id: str | None = None,
+    logger=None,
 ) -> dict:
     """
     Run AlphaFold validation for a single sequence (no ProteinMPNN).
@@ -475,7 +495,10 @@ def run_alphafold_only(
         pdb_file = os.path.abspath(pdb_file)
 
     if not os.path.exists(pdb_file):
-        return {"error": f"No se encuentra el archivo PDB: {pdb_file}"}
+        msg = f"PDB file not found: {pdb_file}"
+        if logger:
+            logger.error(msg)
+        return {"error": msg}
 
     output_dir = f"{OUTPUTS_DIR}/{run_name}_af_only"
     os.makedirs(output_dir, exist_ok=True)
@@ -533,34 +556,33 @@ print(json.dumps(result))
     with open(temp_script_path, "w") as f:
         f.write(af_script)
 
-    print("=" * 60)
-    print(" ALPHAFOLD ONLY VALIDATION")
-    print("=" * 60)
-    print(f"   PDB: {pdb_file}")
-    print(f"   Output: {output_dir}")
-    print("=" * 60)
+    if logger:
+        logger.info("AlphaFold-only validation started pdb=%s seq_len=%d", pdb_file, len(seq))
 
     try:
+        t0 = time.time()
         result = subprocess.run(
             ["python3", temp_script_path],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
-            cwd="/workspace"
+            cwd="/workspace",
+            env=run_env_for_child(run_id) if run_id else None,
         )
+        if logger:
+            log_subprocess_result(logger, result, ["python3", temp_script_path], label="af_only", elapsed_sec=time.time() - t0)
 
-        # 🔹 Parsear salida JSON
+        if result.returncode != 0:
+            return {"error": f"AlphaFold subprocess failed with code {result.returncode}", "stderr": result.stderr}
+
         output = json.loads(result.stdout.strip().split("\n")[-1])
-
+        if logger:
+            logger.info("AlphaFold-only result: %s", output)
         return output
 
-    except subprocess.CalledProcessError as e:
-        return {
-            "error": str(e),
-            "stdout": e.stdout,
-            "stderr": e.stderr
-        }
     except Exception as e:
+        if logger:
+            logger.exception("AlphaFold-only failed")
         return {"error": str(e)}
     finally:
         if os.path.exists(temp_script_path):
@@ -569,7 +591,7 @@ print(json.dumps(result))
 
 def main():
     parser = argparse.ArgumentParser(description="Step 2: ProteinMPNN sequence design")
-    parser.add_argument("--run_id", type=str, default=None, help="If set, update run_status DB on completion (task MPNN+RF_DIFFUSION)")
+    parser.add_argument("--run_id", "--run-id", dest="run_id", type=str, default=None, help="Run ID for logging and DB")
     parser.add_argument("--run_status_db", type=str, default="/workspace/outputs/run_status.db", help="Path to run_status SQLite DB")
     parser.add_argument("--run_name", type=str, default="pipeline_run", help="Name for output folder (outputs/{run_name}/)")
     parser.add_argument("--input_pdb", type=str, default="/workspace/outputs/test_200226_1_0.pdb", help="Path to input PDB file (default: outputs/{run_name}_{design_num}.pdb)")
@@ -586,54 +608,51 @@ def main():
     parser.add_argument("--num_designs", type=int, default=1)
     args = parser.parse_args()
 
+    run_id = resolve_run_id(args.run_id)
+    run_logger = get_logger(run_id, PROCESS_NAME)
+    run_logger.info("%s started", PROCESS_NAME)
+    run_logger.info("CLI arguments: %s", vars(args))
+
     start = time.time()
     pdb_file = args.input_pdb.strip() if (args.input_pdb and args.input_pdb.strip()) else None
     success = False
+    common_kwargs = dict(
+        run_name=args.run_name,
+        contigs=args.contigs,
+        pdb_file=pdb_file,
+        copies=args.copies,
+        num_seqs=args.num_seqs,
+        initial_guess=args.initial_guess,
+        num_recycles=args.num_recycles,
+        use_multimer=args.use_multimer,
+        rm_aa=args.rm_aa,
+        mpnn_sampling_temp=args.mpnn_sampling_temp,
+        num_designs=args.num_designs,
+        design_num=args.design_num,
+        run_id=run_id,
+        logger=run_logger,
+    )
     try:
         if args.use_alphafold:
-            success = run_proteinmpnn_alphafold(
-                run_name=args.run_name,
-                contigs=args.contigs,
-                pdb_file=pdb_file,
-                copies=args.copies,
-                num_seqs=args.num_seqs,
-                initial_guess=args.initial_guess,
-                num_recycles=args.num_recycles,
-                use_multimer=args.use_multimer,
-                rm_aa=args.rm_aa,
-                mpnn_sampling_temp=args.mpnn_sampling_temp,
-                num_designs=args.num_designs,
-                design_num=args.design_num,
-            )
+            success = run_proteinmpnn_alphafold(**common_kwargs)
         else:
-            success = run_proteinmpnn_only(
-                run_name=args.run_name,
-                contigs=args.contigs,
-                pdb_file=pdb_file,
-                copies=args.copies,
-                num_seqs=args.num_seqs,
-                initial_guess=args.initial_guess,
-                num_recycles=args.num_recycles,
-                use_multimer=args.use_multimer,
-                rm_aa=args.rm_aa,
-                mpnn_sampling_temp=args.mpnn_sampling_temp,
-                num_designs=args.num_designs,
-                design_num=args.design_num,
-            )
-    except Exception as e:
+            success = run_proteinmpnn_only(**common_kwargs)
+    except Exception:
+        run_logger.exception("%s failed with exception", PROCESS_NAME)
         if args.run_id and args.run_status_db and os.path.isfile(args.run_status_db):
-            update_run_status_mpnn(args.run_status_db, args.run_id, STATUS_ERROR, error_details=str(e))
-        raise
-    print("=" * 60)
-    print(f"TIEMPO TOTAL: {time.time() - start:.2f} segundos")
-    print("=" * 60)
+            update_run_status_mpnn(args.run_status_db, args.run_id, STATUS_ERROR, error_details="Exception during MPNN step")
+        run_logger.info("%s finished with exit_code=1", PROCESS_NAME)
+        sys.exit(1)
+
+    run_logger.info("Total elapsed: %.2f seconds success=%s", time.time() - start, success)
     if args.run_id and args.run_status_db and os.path.isfile(args.run_status_db):
         if success:
             output_dir = os.path.join(OUTPUTS_DIR, args.run_name)
             try:
                 save_mpnn_results_to_db(args.run_status_db, args.run_id, args.run_name, output_dir, args)
-            except Exception as e:
-                print(f"Warning: could not save results to DB: {e}")
+                run_logger.info("MPNN results saved to DB for run_id=%s", args.run_id)
+            except Exception:
+                run_logger.exception("Could not save MPNN results to DB")
             output_csv = None
             csv_path = os.path.join(output_dir, "mpnn_results.csv")
             if os.path.isfile(csv_path):
@@ -641,7 +660,7 @@ def main():
                     with open(csv_path, "r", encoding="utf-8") as f:
                         output_csv = f.read()
                 except Exception:
-                    pass
+                    run_logger.exception("Failed to read mpnn_results.csv")
             output_fasta = None
             fasta_path = os.path.join(output_dir, "design.fasta")
             if os.path.isfile(fasta_path):
@@ -649,11 +668,15 @@ def main():
                     with open(fasta_path, "r", encoding="utf-8") as f:
                         output_fasta = f.read()
                 except Exception:
-                    pass
+                    run_logger.exception("Failed to read design.fasta")
             update_run_status_mpnn(args.run_status_db, args.run_id, STATUS_COMPLETED, output_csv=output_csv, output_fasta=output_fasta)
+            run_logger.info("run_status COMPLETED for run_id=%s", args.run_id)
         else:
             update_run_status_mpnn(args.run_status_db, args.run_id, STATUS_ERROR, error_details="MPNN step exited with non-zero return code")
-    sys.exit(0 if success else 1)
+            run_logger.error("run_status ERROR for run_id=%s", args.run_id)
+    exit_code = 0 if success else 1
+    run_logger.info("%s finished with exit_code=%s", PROCESS_NAME, exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
